@@ -50,8 +50,12 @@ Windows 用 `where.exe codex-516-guard` 查实际路径；`uv tool update-shell`
 
 ```bash
 codex-516-guard                          # 前台跑起（默认 127.0.0.1:8787）
-codex-516-guard --port 8790 --log-level debug   # 可选参数：--host/--port/--upstream/--log-level
+codex-516-guard --port 8790 --log-level debug   # 可选：--host/--port/--upstream/--log-level/--strict-port
 ```
+
+**端口避让**：默认端口（8787）被占用时，自动向后找第一个空闲端口（最多试 20 个）并在日志里打印实际
+端口 + 对应的 `openai_base_url`。手动指定用 `--port`。若你已按固定端口给 Codex 接线（`openai_base_url`），
+加 `--strict-port`——端口被占时**直接报错**而不是漂到别的端口（避免代理在跑、Codex 却连不上的隐性错配）。
 
 升级 / 卸载：`uv tool upgrade codex-516-guard` / `uv tool uninstall codex-516-guard`。
 
