@@ -155,41 +155,43 @@ def _uninstall_macos() -> None:
     print(f"removed launchd LaunchAgent{'' if existed else ' (was not present)'}: {path}")
 
 
-# --- Windows (Startup-folder VBS launcher; no admin, hidden window) ----------
+# --- Windows (manual autostart, by design) ----------------------------------
 #
-# Task Scheduler (onlogon) would also work but `schtasks /create` requires an
-# elevated shell on locked-down machines. A Startup-folder launcher needs no
-# admin; a tiny VBS wrapper runs the console-less proxy fully hidden.
+# We intentionally do NOT register Windows autostart programmatically. Writing an
+# autostart entry (Startup VBS / Run key / task) and launching a hidden process
+# is exactly the persistence pattern behavioral antivirus flags as a trojan
+# (observed: Kaspersky PDM:Trojan.Win32.Generic on the launching python.exe).
+# A user-created Startup shortcut is trusted by the same AV. So print the steps,
+# pointing at the windowless launcher, and register nothing.
 
 
-def _startup_vbs_path() -> Path:
-    startup = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / \
-        "Start Menu" / "Programs" / "Startup"
-    return startup / f"{LABEL}.vbs"
+def _guiw_exe() -> str:
+    """The windowless launcher (codex-516-guardw.exe) beside the console exe."""
+    console = _resolve_exe()
+    if console.lower().endswith(".exe"):
+        cand = console[:-4] + "w.exe"
+        if os.path.exists(cand):
+            return cand
+    return shutil.which(LABEL + "w") or (console[:-4] + "w.exe"
+                                         if console.lower().endswith(".exe") else console)
 
 
 def _install_windows(argv: list[str]) -> None:
-    # NB: never `taskkill /im codex-516-guard.exe` — the console-script launcher
-    # (and its uv trampoline parent) share that image name, so it would kill this
-    # very command mid-run. Registering the launcher is idempotent; a duplicate
-    # start just fails to bind the port and exits.
-    cmd = subprocess.list2cmdline(argv)              # e.g. "C:\...\codex-516-guard.exe"
-    vbs_literal = '"' + cmd.replace('"', '""') + '"'  # VBScript string literal
-    vbs = f'CreateObject("WScript.Shell").Run {vbs_literal}, 0, False\n'
-    path = _startup_vbs_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(vbs, encoding="utf-8")
-    _run(["wscript", str(path)], check=False)        # start now, hidden
-    print(f"installed + started Startup launcher (no admin, hidden): {path}")
-    print("  runs at next logon; disable with: codex-516-guard uninstall-service")
+    exe_w = _guiw_exe()
+    extra = subprocess.list2cmdline(argv[1:])
+    print("Windows autostart is not registered automatically — behavioral antivirus")
+    print("flags programmatic startup persistence as trojan-like. Set it up by hand")
+    print("(a user-created shortcut is AV-trusted):")
+    print("  1. press Win+R, run:  shell:startup")
+    print(f"  2. create a shortcut whose target is:  {exe_w}")
+    if extra:
+        print(f"     append these arguments:  {extra}")
+    print("  (…guardw.exe is windowless — no console window at logon)")
 
 
 def _uninstall_windows() -> None:
-    path = _startup_vbs_path()
-    existed = path.exists()
-    path.unlink(missing_ok=True)
-    print(f"removed Startup launcher{'' if existed else ' (was not present)'}: {path}")
-    print("  a currently-running instance stays up until you close it or log off")
+    print("Windows autostart is manual: delete your codex-516-guard shortcut from")
+    print("the Startup folder (Win+R -> shell:startup).")
 
 
 # --- dispatch ----------------------------------------------------------------

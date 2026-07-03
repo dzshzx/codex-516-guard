@@ -1,6 +1,6 @@
 [project]
 name = "codex-516-guard"
-version = "0.2.4"
+version = "0.2.5"
 description = "Local Responses proxy for OpenAI Codex CLI: folds gpt-5.5 518n-2 reasoning truncation (516 degradation) via the official openai_base_url wiring — no provider change, WebSocket-first, no fallback noise."
 readme = "README.md"
 license = "MIT"
@@ -32,6 +32,11 @@ Issues = "https://github.com/dzshzx/codex-516-guard/issues"
 
 [project.scripts]
 codex-516-guard = "guard.cli:main"
+
+# Windowless launcher (GUI subsystem on Windows → no console window at logon).
+# Use it as the target of a manually-created Startup shortcut on Windows.
+[project.gui-scripts]
+codex-516-guardw = "guard.cli:main"
 
 [build-system]
 requires = ["hatchling"]
