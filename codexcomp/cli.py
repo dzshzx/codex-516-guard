@@ -11,10 +11,30 @@ import argparse
 import logging
 import os
 import socket
+import sys
+import tempfile
 
 from . import service
 
 PORT_SCAN_TRIES = 20
+
+
+def _bind_headless_streams() -> None:
+    """pythonw (the codexcompw gui-scripts entry) starts with sys.stdout/sys.stderr
+    = None; print() and uvicorn's stderr logging would then crash the process at
+    startup. Bind both to an append-mode log file so the windowless entry survives
+    and stays observable."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    log_dir = os.path.join(base, "codexcomp")
+    os.makedirs(log_dir, exist_ok=True)
+    stream = open(os.path.join(log_dir, "codexcompw.log"), "a",
+                  buffering=1, encoding="utf-8", errors="replace")
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
 
 
 def _add_run_flags(p: argparse.ArgumentParser) -> None:
@@ -73,6 +93,7 @@ def _serve(args) -> int:
 
 
 def main() -> None:
+    _bind_headless_streams()
     parser = argparse.ArgumentParser(
         prog="codexcomp",
         description=(
