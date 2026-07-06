@@ -150,8 +150,9 @@ def agent_usage(
 def _fmt(usage: dict[str, Any] | None) -> str:
     u = usage or {}
     cached = (u.get("input_tokens_details") or {}).get("cached_tokens")
+    cached_part = f"cached={cached} " if cached is not None else ""
     return (
-        f"in={u.get('input_tokens')} cached={cached} out={u.get('output_tokens')} "
+        f"in={u.get('input_tokens')} {cached_part}out={u.get('output_tokens')} "
         f"reason={reasoning_tokens(u)} total={u.get('total_tokens')}"
     )
 

@@ -62,7 +62,9 @@ TRUNCATION_VERDICTS = {"continue", "tier_out_of_window", "max_continue",
                        "no_encrypted_content"}
 ORPHAN_FOLD_GRACE_S = 15  # wait after a failed `on` run for its fold to finish
 FOLD_ROUND_RE = re.compile(
-    r"round (\d+): in=(\d+) (?:cached=(\d+) )?out=(\d+) reason=(\d+) total=(\d+) \| "
+    # cached= may be absent (>=0.4.0 omits it when unknown) or literally
+    # `cached=None` (0.3.x printed the raw value) — both must not break the match
+    r"round (\d+): in=(\d+) (?:cached=(\d+|None) )?out=(\d+) reason=(\d+) total=(\d+) \| "
     r"n=(None|\d+) buffered=(\[.*?\]) -> (\w+)"
 )
 
@@ -80,15 +82,22 @@ def proxy_unit_active() -> bool:
     return probe.returncode == 0
 
 
-def journal_cursor() -> str | None:
-    out = subprocess.run(
+def journal_cursor() -> tuple[bool, str | None]:
+    """(ok, cursor). ok=False means journalctl itself failed — the caller must
+    skip journal capture for the run rather than fall back to an unbounded read
+    that would attribute the whole history to it."""
+    probe = subprocess.run(
         ["journalctl", "--user", "-u", "codexcomp", "-n", "1",
          "--show-cursor", "-q", "--no-pager"],
-        capture_output=True, text=True).stdout
-    for line in out.splitlines():
+        capture_output=True, text=True)
+    if probe.returncode != 0:
+        print(f"warning: journalctl failed (rc={probe.returncode}) — "
+              "skipping fold capture for this run")
+        return False, None
+    for line in probe.stdout.splitlines():
         if line.startswith("-- cursor:"):
-            return line.split("-- cursor:", 1)[1].strip()
-    return None  # empty journal: read unbounded, everything there is new
+            return True, line.split("-- cursor:", 1)[1].strip()
+    return True, None  # empty journal: read unbounded, everything there is new
 
 
 def journal_fold_lines(cursor: str | None) -> list[str]:
@@ -129,7 +138,8 @@ def run_once(args, out_dir: Path, run_id: str, model: str, effort: str,
 
     t0 = time.time()
     started = iso_now()
-    cursor = journal_cursor() if (mode == "on" and use_journal) else None
+    capture, cursor = (journal_cursor() if (mode == "on" and use_journal)
+                       else (False, None))
     with open(ev_f, "w") as evh:
         proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=evh,
                               stderr=subprocess.PIPE, text=True)
@@ -145,7 +155,7 @@ def run_once(args, out_dir: Path, run_id: str, model: str, effort: str,
             usage = event.get("usage")
 
     answer = last_f.read_text().strip() if last_f.exists() else ""
-    lines = journal_fold_lines(cursor) if (mode == "on" and use_journal) else []
+    lines = journal_fold_lines(cursor) if capture else []
     if lines:
         fold_f.write_text("\n".join(lines) + "\n")
 
@@ -263,7 +273,8 @@ def main() -> int:
         if (use_journal and mode == "on" and rec["exit"] == 0
                 and not rec["fold_rounds"] and not warned_no_fold):
             print("warning: an `on` run produced no fold lines in the journal — "
-                  "is Codex traffic actually reaching the systemd codexcomp unit?")
+                  "the unit may log above info level, journald may lag, or Codex "
+                  "traffic isn't reaching the systemd codexcomp unit")
             warned_no_fold = True
         if mode == "on" and rec["exit"] != 0:
             # the proxy may still be finishing this run's fold; keep its late
@@ -272,8 +283,9 @@ def main() -> int:
         time.sleep(2)
 
     print()
-    print(summarize(recs))
-    failures = [r["id"] for r in recs if r["exit"] != 0]
+    grid_recs = [r for r in recs if r["id"] in grid_ids]  # match the counter's scope
+    print(summarize(grid_recs))
+    failures = [r["id"] for r in grid_recs if r["exit"] != 0]
     if failures:
         print(f"\nfailed runs (excluded from nothing, judge for yourself): {failures}")
     return 0
