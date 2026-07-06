@@ -142,6 +142,26 @@ round 3: in=22606 out=566 reason=291 total=23172 | n=None buffered=[...] -> clea
 done: 3 round(s) | ... | status=completed stop=natural
 ```
 
+## Evals
+
+`evals/candy_eval.py` measures the fix end-to-end: it runs a model × effort ×
+proxy-on/off grid of `codex exec` calls on the candy pigeonhole puzzle from
+[haowang02/codex-candy-eval](https://github.com/haowang02/codex-candy-eval)
+(answer: 21, independently re-verified by brute force) and reports boundary-cut
+rate, reasoning tokens and accuracy per condition. Both modes wire
+`openai_base_url` explicitly, so the ambient config doesn't matter; interrupted
+grids resume by re-running the same command.
+
+```bash
+codexcomp &                                    # proxy must be running for `on`
+python evals/candy_eval.py -m gpt-5.5 -r xhigh -n 5   # small grid
+python evals/candy_eval.py                            # full 80-run grid
+```
+
+An 80-run grid of this eval (2026-07-06) found every unmitigated gpt-5.5 run
+cut exactly on a `518n−2` boundary, 15% vs 90% accuracy off/on — details in
+[openai/codex#30364](https://github.com/openai/codex/issues/30364#issuecomment-4893087004).
+
 ## FAQ
 
 **Does it touch normal turns?**

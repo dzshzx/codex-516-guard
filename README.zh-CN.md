@@ -133,6 +133,24 @@ round 3: in=22606 out=566 reason=291 total=23172 | n=None buffered=[...] -> clea
 done: 3 round(s) | ... | status=completed stop=natural
 ```
 
+## 评测
+
+`evals/candy_eval.py` 端到端度量修复效果：在
+[haowang02/codex-candy-eval](https://github.com/haowang02/codex-candy-eval)
+的糖果抽取题（答案 21，已独立穷举复核）上跑「模型 × effort × 代理开/关」的
+`codex exec` 矩阵，按条件统计边界截断率、reasoning tokens 与正确率。两种模式都
+显式传 `openai_base_url`，不依赖本机既有接线；中断后重跑同一命令即断点续跑。
+
+```bash
+codexcomp &                                    # `on` 模式需要代理已在运行
+python evals/candy_eval.py -m gpt-5.5 -r xhigh -n 5   # 小矩阵
+python evals/candy_eval.py                            # 完整 80 跑矩阵
+```
+
+该评测的一次 80 跑矩阵（2026-07-06）显示：无代理的 gpt-5.5 全部精确截断在
+`518n−2` 边界上，开/关正确率 90% vs 15%——详见
+[openai/codex#30364](https://github.com/openai/codex/issues/30364#issuecomment-4893087004)。
+
 ## 常见问题
 
 **会影响正常（未截断）的轮次吗？**
