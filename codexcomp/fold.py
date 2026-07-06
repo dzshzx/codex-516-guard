@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 from typing import Any, AsyncIterator, Awaitable, Callable
 
+import httpx
+
 log = logging.getLogger("codexcomp.fold")
 
 STEP = 518
@@ -75,10 +77,17 @@ def commentary_nudge() -> dict[str, Any]:
     }
 
 
-def next_round_body(base_body: dict[str, Any], input_items: list[Any]) -> dict[str, Any]:
-    """The agent's request re-shaped for a continuation round: explicit input,
-    always streamed, encrypted reasoning included, no previous_response_id
-    (state is carried in the replayed items)."""
+def next_round_body(
+    base_body: dict[str, Any],
+    input_items: list[Any],
+) -> dict[str, Any]:
+    """Shape the agent's request for one upstream round.
+
+    Preserve previous_response_id whenever Codex supplied it. Codex often sends
+    only incremental input items and relies on that id for server-side history;
+    hidden continuation rounds still need the same base context plus replayed
+    reasoning to avoid losing earlier turns.
+    """
     body = dict(base_body)
     body["stream"] = True
     body["input"] = input_items
@@ -86,7 +95,6 @@ def next_round_body(base_body: dict[str, Any], input_items: list[Any]) -> dict[s
     if ENC_INCLUDE not in include:
         include.append(ENC_INCLUDE)
     body["include"] = include
-    body.pop("previous_response_id", None)
     return body
 
 
@@ -164,11 +172,15 @@ def _terminal_event(
     *,
     incomplete_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Downstream terminal: round-1 response identity, upstream status (or a
-    synthetic incomplete), our reconstructed output + single-response usage,
-    true billed cost and per-round breakdown in metadata."""
+    """Downstream terminal: final upstream response identity, upstream status
+    (or a synthetic incomplete), our reconstructed output + single-response
+    usage, true billed cost and per-round breakdown in metadata.
+
+    The completed response id must be the final upstream id so Codex chains the
+    next turn to the clean response, not to an earlier truncated round.
+    """
     tresp = (upstream_terminal or {}).get("response") or {}
-    resp = dict(base_response or tresp)
+    resp = dict(tresp or base_response or {})
     resp["output"] = output
     resp["usage"] = usage
     metadata = dict(resp.get("metadata") or {})
@@ -203,7 +215,7 @@ async def fold(
     base_response: dict[str, Any] | None = None
     saw_done = False
     final_output: list[dict[str, Any]] = []
-    replay_tail: list[Any] = []
+    reasoning_replay: list[Any] = []
     summed_usage: dict[str, Any] = {}
     first_usage: dict[str, Any] | None = None
     rounds_info: list[dict[str, Any]] = []
@@ -215,7 +227,13 @@ async def fold(
         return ev
 
     round_no = 0
-    events = await open_round(next_round_body(base_body, orig_input))
+    round1_body = next_round_body(base_body, orig_input)
+    log.info(
+        "open round 1: previous_response_id=%s input_items=%d",
+        "yes" if round1_body.get("previous_response_id") else "no",
+        len(round1_body.get("input") or []),
+    )
+    events = await open_round(round1_body)
 
     while True:
         round_no += 1
@@ -276,7 +294,7 @@ async def fold(
                     yield stamp(ev)  # unknown scope: forward best-effort
         except RoundOpenError:
             raise  # only raised before any event; handled by caller for round 1
-        except Exception as exc:  # upstream died mid-stream
+        except (httpx.HTTPError, ConnectionError, TimeoutError, OSError) as exc:
             log.warning("round %d: upstream error mid-stream: %r", round_no, exc)
             _sum_usage(summed_usage, usage)
             yield stamp(_terminal_event(
@@ -285,6 +303,9 @@ async def fold(
                 rounds_info, summed_usage, "upstream_error",
                 incomplete_reason="upstream_error"))
             return
+        except Exception:
+            log.exception("round %d: fold state-machine bug", round_no)
+            raise
 
         # ---- round ended: decide continue / stop ----------------------------
         _sum_usage(summed_usage, usage)
@@ -297,6 +318,8 @@ async def fold(
 
         do_continue = (
             terminal is not None
+            and terminal.get("type") == "response.completed"
+            and ((terminal.get("response") or {}).get("status") in (None, "completed"))
             and in_continue_window(n)
             and has_enc
             and round_no <= MAX_CONTINUE
@@ -318,9 +341,22 @@ async def fold(
         )
 
         if do_continue:
-            replay_tail.extend([*round_reasoning, commentary_nudge()])
+            # Replayed reasoning reconstructs hidden continuation state. Keep a
+            # single trailing nudge rather than accumulating previous nudges.
+            reasoning_replay.extend(round_reasoning)
             try:
-                events = await open_round(next_round_body(base_body, orig_input + replay_tail))
+                cont_body = next_round_body(
+                    base_body,
+                    orig_input + reasoning_replay + [commentary_nudge()],
+                )
+                log.info(
+                    "open continuation round %d: previous_response_id=%s input_items=%d replay_items=%d",
+                    round_no + 1,
+                    "yes" if cont_body.get("previous_response_id") else "no",
+                    len(cont_body.get("input") or []),
+                    len(reasoning_replay),
+                )
+                events = await open_round(cont_body)
             except RoundOpenError as exc:
                 log.warning("continuation round %d failed to open: %s", round_no + 1, exc)
                 yield stamp(_terminal_event(
