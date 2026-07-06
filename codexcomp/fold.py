@@ -13,6 +13,7 @@ Mechanism credit: neteroster/CodexCont (MIT). Implementation is original.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -20,7 +21,10 @@ log = logging.getLogger("codexcomp.fold")
 
 STEP = 518
 MIN_N = 1          # continue only when truncation tier n >= MIN_N
-MAX_N = 6          # stop forcing once n > MAX_N (0 = no cap)
+MAX_N = 0          # highest tier to force-continue; 0 = no cap. Cuts up to n=21
+                   # observed in the wild, and a natural stop landing exactly on
+                   # 518n-2 is ~1/518 at any tier, so a cap buys almost no
+                   # false-positive safety while releasing real truncations.
 MAX_CONTINUE = 3   # continuation rounds after round 1 (runaway guard)
 MARKER_TEXT = "Continue thinking..."
 ENC_INCLUDE = "reasoning.encrypted_content"
@@ -211,7 +215,31 @@ async def fold(
 
     Sole owner of downstream terminal shapes: upstream failures surface as
     terminal events (response.failed for a rejected round 1, response.incomplete
-    otherwise) — RoundOpenError never escapes to the transport."""
+    otherwise) — RoundOpenError never escapes to the transport.
+
+    A fold torn down from downstream (client disconnect / task cancel) delivers
+    no terminal; it is logged as `fold aborted downstream` so it never vanishes
+    from the journal without a trace."""
+    stats: dict[str, Any] = {"rounds": 0, "usage": {}}
+    inner = _fold_inner(base_body, open_round, stats)
+    try:
+        async for ev in inner:
+            yield ev
+    except (GeneratorExit, asyncio.CancelledError):
+        log.warning("fold aborted downstream after %d round(s) | %s",
+                    stats["rounds"], _fmt(stats["usage"]))
+        raise
+    finally:
+        await inner.aclose()
+
+
+async def _fold_inner(
+    base_body: dict[str, Any],
+    open_round: RoundOpener,
+    stats: dict[str, Any],
+) -> AsyncIterator[dict[str, Any] | object]:
+    """The fold state machine; `stats` mirrors round count / summed usage for
+    the abort log in fold()."""
     orig_input = list(base_body.get("input") or [])
     seq = 0
     ds_oi = 0
@@ -255,59 +283,66 @@ async def fold(
         terminal: dict[str, Any] | None = None
         usage = None
 
-        try:
-            async for ev in events:
-                if ev is DONE:
-                    saw_done = True
-                    continue
-                etype = ev.get("type", "")
+        while True:
+            # Only the upstream pull is guarded: an exception raised by the
+            # event-processing below is a proxy bug and must surface loudly,
+            # not be disguised as an upstream_error incomplete.
+            try:
+                ev = await events.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception as exc:  # upstream died mid-stream
+                log.warning("round %d: upstream error mid-stream: %r", round_no, exc)
+                _sum_usage(summed_usage, usage)
+                yield incomplete("upstream_error")
+                return
 
-                if etype in ("response.created", "response.in_progress"):
-                    if round_no == 1:
-                        if etype == "response.created":
-                            base_response = ev.get("response") or {}
-                        yield stamp(ev)
-                    continue
-                if etype in TERMINAL_TYPES:
-                    terminal = ev
-                    usage = (ev.get("response") or {}).get("usage")
-                    break
+            if ev is DONE:
+                saw_done = True
+                continue
+            etype = ev.get("type", "")
 
-                oi = ev.get("output_index")
-                if etype == "response.output_item.added":
-                    item = ev.get("item") or {}
-                    if item.get("type") == "reasoning":
-                        kind[oi] = "reasoning"
-                        oi_to_ds[oi] = ds_oi
-                        ev["output_index"] = ds_oi
-                        ds_oi += 1
-                        yield stamp(ev)
-                    else:
-                        kind[oi] = "buffered"
-                        buffered.append({"oi": oi, "item": item, "events": [ev]})
-                    continue
-
-                k = kind.get(oi)
-                if k == "reasoning":
-                    if oi in oi_to_ds:
-                        ev["output_index"] = oi_to_ds[oi]
-                    if etype == "response.output_item.done":
-                        item = ev.get("item") or {}
-                        round_reasoning.append(item)
-                        final_output.append(item)
+            if etype in ("response.created", "response.in_progress"):
+                if round_no == 1:
+                    if etype == "response.created":
+                        base_response = ev.get("response") or {}
                     yield stamp(ev)
-                elif k == "buffered":
-                    entry = next(e for e in buffered if e["oi"] == oi)
-                    entry["events"].append(ev)
-                    if etype == "response.output_item.done":
-                        entry["item"] = ev.get("item") or entry["item"]
+                continue
+            if etype in TERMINAL_TYPES:
+                terminal = ev
+                usage = (ev.get("response") or {}).get("usage")
+                break
+
+            oi = ev.get("output_index")
+            if etype == "response.output_item.added":
+                item = ev.get("item") or {}
+                if item.get("type") == "reasoning":
+                    kind[oi] = "reasoning"
+                    oi_to_ds[oi] = ds_oi
+                    ev["output_index"] = ds_oi
+                    ds_oi += 1
+                    yield stamp(ev)
                 else:
-                    yield stamp(ev)  # unknown scope: forward best-effort
-        except Exception as exc:  # upstream died mid-stream
-            log.warning("round %d: upstream error mid-stream: %r", round_no, exc)
-            _sum_usage(summed_usage, usage)
-            yield incomplete("upstream_error")
-            return
+                    kind[oi] = "buffered"
+                    buffered.append({"oi": oi, "item": item, "events": [ev]})
+                continue
+
+            k = kind.get(oi)
+            if k == "reasoning":
+                if oi in oi_to_ds:
+                    ev["output_index"] = oi_to_ds[oi]
+                if etype == "response.output_item.done":
+                    item = ev.get("item") or {}
+                    round_reasoning.append(item)
+                    final_output.append(item)
+                yield stamp(ev)
+            elif k == "buffered":
+                entry = next(e for e in buffered if e["oi"] == oi)
+                entry["events"].append(ev)
+                if etype == "response.output_item.done":
+                    entry["item"] = ev.get("item") or entry["item"]
+            else:
+                yield stamp(ev)  # unknown scope: forward best-effort
 
         # ---- round ended: decide continue / stop ----------------------------
         _sum_usage(summed_usage, usage)
@@ -316,6 +351,7 @@ async def fold(
         rt = reasoning_tokens(usage)
         n = tier_n(rt)
         rounds_info.append({"round": round_no, "reasoning_tokens": rt, "n": n})
+        stats["rounds"], stats["usage"] = round_no, summed_usage
         has_enc = bool(round_reasoning and round_reasoning[-1].get("encrypted_content"))
 
         do_continue = (

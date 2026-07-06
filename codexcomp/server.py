@@ -267,8 +267,22 @@ async def responses_post(request: Request) -> Response:
     events = drive_fold(request.app.state, upstream_headers(request.headers.raw), body)
 
     async def stream() -> AsyncIterator[bytes]:
-        async for ev in events:
-            yield sse_bytes(ev)
+        sent_done = False
+        try:
+            async for ev in events:
+                if ev is DONE:
+                    sent_done = True
+                yield sse_bytes(ev)
+        finally:
+            # Deterministic teardown on downstream disconnect: without this the
+            # fold generator (and its upstream connection) lingers until the
+            # event loop's async-gen finalizer runs.
+            await events.aclose()
+        if not sent_done:
+            # fold() stops at the terminal event and normally never sees
+            # upstream's trailing [DONE]; SSE clients that wait for it would
+            # hang until connection close.
+            yield b"data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -301,11 +315,17 @@ async def responses_ws(ws: WebSocket) -> None:
                 await ws.send_text(json.dumps(sess.prewarm_ack(body), ensure_ascii=False))
                 continue
             sess.note_request(body)
-            async for ev in drive_fold(ws.app.state, headers, body):
-                if ev is DONE:
-                    continue
-                sess.note_event(ev)
-                await ws.send_text(json.dumps(ev, ensure_ascii=False))
+            events = drive_fold(ws.app.state, headers, body)
+            try:
+                async for ev in events:
+                    if ev is DONE:
+                        continue
+                    sess.note_event(ev)
+                    await ws.send_text(json.dumps(ev, ensure_ascii=False))
+            finally:
+                # a failed send_text must not leave the fold generator (and its
+                # upstream connection) dangling until GC finalization
+                await events.aclose()
     except WebSocketDisconnect:
         pass
 

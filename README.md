@@ -86,8 +86,8 @@ That's it. Disable by removing that line and stopping the proxy; upgrade / unins
 
 A state machine (`codexcomp/fold.py`) runs per round:
 
-1. **Detect** — `reasoning_tokens == 518n − 2` (`1 ≤ n ≤ 6`, ≤ 3 continuations) marks the
-   round as truncated.
+1. **Detect** — `reasoning_tokens == 518n − 2` (any tier by default; cuts up to n=21 observed —
+   see `--max-n` / `--max-continue`) marks the round as truncated.
 2. **Continue** — discard the tentative output and replay the round's reasoning items (incl.
    `encrypted_content`) plus one `phase:"commentary"` `"Continue thinking..."` message as the
    next input.
@@ -109,6 +109,8 @@ A state machine (`codexcomp/fold.py`) runs per round:
 | `--port` | `8787` | Must match `openai_base_url`; if busy the proxy exits. |
 | `--upstream` | `https://chatgpt.com/backend-api/codex` | Upstream base URL. |
 | `--log-level` | `info` | One of `critical` / `error` / `warning` / `info` / `debug`. |
+| `--max-n` | `0` | Highest `518n−2` tier to auto-continue; `0` = no cap (cuts up to n=21 observed). |
+| `--max-continue` | `3` | Max continuation rounds per request (runaway guard). |
 
 ## Autostart (optional, off by default)
 
@@ -142,6 +144,12 @@ round 3: in=22606 out=566 reason=291 total=23172 | n=None buffered=[...] -> clea
 done: 3 round(s) | ... | status=completed stop=natural
 ```
 
+Round verdicts: `continue` (cut detected → will continue), `clean` (natural end),
+`tier_out_of_window` / `max_continue` / `no_encrypted_content` (cut detected but released
+as-is), `upstream_eof` (stream ended without a terminal event). `done:` lines end with
+`stop=natural` or the release reason. A fold torn down by a client disconnect logs
+`fold aborted downstream after N round(s)` instead of a `done:` line.
+
 ## Evals
 
 `evals/candy_eval.py` measures the fix end-to-end: it runs a model × effort ×
@@ -169,8 +177,8 @@ No. Clean rounds pass through byte-for-byte; the fold path only engages on a det
 `518n−2` truncation.
 
 **What does a fold cost?**
-Continuation rounds spend extra real tokens, bounded by the `n` window (`1 ≤ n ≤ 6`) and a
-3-continuation cap. The true cumulative usage is reported under
+Continuation rounds spend extra real tokens, bounded by the continuation cap
+(`--max-continue`, default 3). The true cumulative usage is reported under
 `metadata.proxy_billed_usage`.
 
 **What happens when OpenAI fixes this upstream?**
@@ -193,8 +201,8 @@ reads, persists, or logs a credential.
 - **Loopback only** — do not expose it on a non-loopback interface.
 - **Unofficial** — it relies on non-contract upstream behavior; an OpenAI-side change may break
   it. Use at your own risk.
-- Continuation spends **extra real tokens** (`metadata.proxy_billed_usage`), bounded by an `n`
-  window and a 3-round cap.
+- Continuation spends **extra real tokens** (`metadata.proxy_billed_usage`), bounded by the
+  `--max-continue` cap (default 3 rounds).
 
 ## Development
 

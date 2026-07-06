@@ -40,7 +40,9 @@ def _resolve_exe() -> str:
 
 
 def _exe_and_args(host: str | None, port: int | None,
-                  upstream: str | None, log_level: str | None) -> list[str]:
+                  upstream: str | None, log_level: str | None,
+                  max_n: int | None = None,
+                  max_continue: int | None = None) -> list[str]:
     """Resolved executable path plus any non-default run flags."""
     argv = [_resolve_exe()]
     if host and host != DEFAULT_HOST:
@@ -51,6 +53,10 @@ def _exe_and_args(host: str | None, port: int | None,
         argv += ["--upstream", upstream]
     if log_level and log_level != "info":
         argv += ["--log-level", log_level]
+    if max_n is not None:
+        argv += ["--max-n", str(max_n)]
+    if max_continue is not None:
+        argv += ["--max-continue", str(max_continue)]
     return argv
 
 
@@ -199,8 +205,9 @@ def _uninstall_windows() -> None:
 # --- dispatch ----------------------------------------------------------------
 
 
-def install(host=None, port=None, upstream=None, log_level=None) -> int:
-    argv = _exe_and_args(host, port, upstream, log_level)
+def install(host=None, port=None, upstream=None, log_level=None,
+            max_n=None, max_continue=None) -> int:
+    argv = _exe_and_args(host, port, upstream, log_level, max_n, max_continue)
     system = platform.system()
     try:
         if system == "Linux":

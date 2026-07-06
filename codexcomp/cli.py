@@ -14,7 +14,7 @@ import socket
 import sys
 import tempfile
 
-from . import DEFAULT_HOST, DEFAULT_PORT, DEFAULT_UPSTREAM, service
+from . import DEFAULT_HOST, DEFAULT_PORT, DEFAULT_UPSTREAM, fold, service
 
 
 def _bind_headless_streams() -> None:
@@ -45,6 +45,12 @@ def _add_run_flags(p: argparse.ArgumentParser) -> None:
                    help=f"upstream base URL (default: {DEFAULT_UPSTREAM})")
     p.add_argument("--log-level", default="info",
                    choices=["critical", "error", "warning", "info", "debug"])
+    p.add_argument("--max-n", type=int, default=None, metavar="N",
+                   help="highest 518n-2 tier to auto-continue, 0 = no cap "
+                        f"(default: {fold.MAX_N})")
+    p.add_argument("--max-continue", type=int, default=None, metavar="K",
+                   help="max continuation rounds per request "
+                        f"(default: {fold.MAX_CONTINUE})")
 
 
 def _port_in_use(host: str, port: int) -> bool:
@@ -63,6 +69,10 @@ def _serve(args) -> int:
               f"port with --port N (and set Codex's openai_base_url to match).",
               flush=True)
         return 1
+    if args.max_n is not None:
+        fold.MAX_N = args.max_n
+    if args.max_continue is not None:
+        fold.MAX_CONTINUE = args.max_continue
     logging.basicConfig(level=args.log_level.upper(),
                         format="%(levelname)s:%(name)s:%(message)s")
     uvicorn.run(build_app(args.upstream), host=args.host, port=args.port,
@@ -97,7 +107,8 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "install-service":
-        raise SystemExit(service.install(args.host, args.port, args.upstream, args.log_level))
+        raise SystemExit(service.install(args.host, args.port, args.upstream,
+                                         args.log_level, args.max_n, args.max_continue))
     if args.cmd == "uninstall-service":
         raise SystemExit(service.uninstall())
     raise SystemExit(_serve(args))

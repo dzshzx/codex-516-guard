@@ -80,7 +80,8 @@ openai_base_url = "http://127.0.0.1:8787/v1"
 
 状态机（`codexcomp/fold.py`）逐轮运行：
 
-1. **检测** — `reasoning_tokens == 518n − 2`（`1 ≤ n ≤ 6`，续写上限 3 轮）即判定该轮被截断。
+1. **检测** — `reasoning_tokens == 518n − 2`（默认不限档位，实测最高见过 n=21 的截断；
+   见 `--max-n` / `--max-continue`）即判定该轮被截断。
 2. **续写** — 丢弃该轮暂定输出，将其 reasoning items（含 `encrypted_content`）连同一条
    `phase:"commentary"` 的 `"Continue thinking..."` 消息重放为下一轮 input。
 3. **折叠** — 推理流全程实时透传，仅放行收尾轮的最终输出，并将 terminal 事件重建为单个响应
@@ -101,6 +102,8 @@ openai_base_url = "http://127.0.0.1:8787/v1"
 | `--port` | `8787` | 须与 `openai_base_url` 一致；被占用时报错退出。 |
 | `--upstream` | `https://chatgpt.com/backend-api/codex` | 上游 base URL。 |
 | `--log-level` | `info` | `critical` / `error` / `warning` / `info` / `debug` 之一。 |
+| `--max-n` | `0` | 自动续写的最高 `518n−2` 档位；`0` = 不设上限（实测最高见过 n=21 的截断）。 |
+| `--max-continue` | `3` | 单请求续写轮数上限（防失控护栏）。 |
 
 ## 开机自启（可选，默认关闭）
 
@@ -133,6 +136,11 @@ round 3: in=22606 out=566 reason=291 total=23172 | n=None buffered=[...] -> clea
 done: 3 round(s) | ... | status=completed stop=natural
 ```
 
+round 行结论：`continue`（检出截断 → 将续写）、`clean`（自然结束）、
+`tier_out_of_window` / `max_continue` / `no_encrypted_content`（检出截断但按原样放行）、
+`upstream_eof`（流结束但无 terminal 事件）。`done:` 行以 `stop=natural` 或放行原因收尾。
+客户端断连导致的折叠中止会记 `fold aborted downstream after N round(s)`，不会有 `done:` 行。
+
 ## 评测
 
 `evals/candy_eval.py` 端到端度量修复效果：在
@@ -157,7 +165,7 @@ python evals/candy_eval.py                            # 完整 80 跑矩阵
 不会。干净轮次逐字节透传；折叠路径只在检出 `518n−2` 截断时介入。
 
 **一次折叠的代价是什么？**
-续写轮会消耗额外的实际 token，由 `n` 窗口（`1 ≤ n ≤ 6`）与 3 轮续写上限约束。真实累计用量
+续写轮会消耗额外的实际 token，由续写轮数上限（`--max-continue`，默认 3）约束。真实累计用量
 记于 `metadata.proxy_billed_usage`。
 
 **上游修复之后怎么办？**
@@ -175,7 +183,7 @@ python evals/candy_eval.py                            # 完整 80 跑矩阵
 - **仅 auth passthrough** — 透传 Codex 的 `Authorization` 头，不读取、不持久化、不记录任何凭据。
 - **仅回环** — 请勿暴露于非回环接口。
 - **非官方** — 依赖上游非公开契约的行为，OpenAI 侧变更可能使其失效，风险自负。
-- 续写会消耗**额外的实际 token**（`metadata.proxy_billed_usage`），由 `n` 窗口与 3 轮上限约束。
+- 续写会消耗**额外的实际 token**（`metadata.proxy_billed_usage`），由 `--max-continue` 上限（默认 3 轮）约束。
 
 ## 开发
 
