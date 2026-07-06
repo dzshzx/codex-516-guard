@@ -242,11 +242,19 @@ async def drive_fold(state: Any, headers: dict[str, str],
     """One folded request: owns the UpstreamRounds lifecycle and yields
     downstream events. Transports only serialize what comes out of here."""
     rounds = UpstreamRounds(state.client, state.upstream_base + "/responses", headers)
+    gen = fold(body, rounds.open)
     try:
-        async for ev in fold(body, rounds.open):
+        async for ev in gen:
             yield ev
     finally:
-        await rounds.aclose()
+        # Close the fold generator FIRST and explicitly: `async for` does not
+        # close its iterator on abnormal exit, and an orphaned fold would log
+        # its abort (and release the upstream stream) only whenever the event
+        # loop's async-gen finalizer / GC got around to it.
+        try:
+            await gen.aclose()
+        finally:
+            await rounds.aclose()
 
 
 def sse_bytes(ev: dict | object) -> bytes:
