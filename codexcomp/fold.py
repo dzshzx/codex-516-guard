@@ -27,6 +27,8 @@ MAX_N = 6          # stop forcing once n > MAX_N (0 = no cap)
 MAX_CONTINUE = 3   # continuation rounds after round 1 (runaway guard)
 MARKER_TEXT = "Continue thinking..."
 ENC_INCLUDE = "reasoning.encrypted_content"
+ZERO_RETRY_MODELS = {"gpt-5.5"}
+ZERO_RETRY_EFFORTS = {"high", "xhigh", "x_high", "extra_high", "extrahigh"}
 
 TERMINAL_TYPES = ("response.completed", "response.failed", "response.incomplete")
 
@@ -71,6 +73,42 @@ def tier_n(tokens: int | None) -> int | None:
 
 def in_continue_window(n: int | None) -> bool:
     return n is not None and n >= MIN_N and (MAX_N == 0 or n <= MAX_N)
+
+
+def requested_effort(body: dict[str, Any]) -> str:
+    """Best-effort extraction of the requested reasoning effort.
+
+    Codex has used several nearby shapes over time; normalize common spelling
+    variants so this can stay narrowly gated without depending on one exact
+    transport version.
+    """
+
+    def normalize(value: Any) -> str:
+        return str(value).strip().lower().replace("-", "_").replace(" ", "_")
+
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if effort:
+            return normalize(effort)
+    for key in ("model_reasoning_effort", "reasoning_effort", "effort"):
+        effort = body.get(key)
+        if effort:
+            return normalize(effort)
+    return ""
+
+
+def should_retry_zero_reasoning(body: dict[str, Any], tokens: int | None) -> bool:
+    """Retry zero-reasoning answers only for high-effort gpt-5.5.
+
+    Zero reasoning can be legitimate for tiny direct answers, so this is much
+    narrower than the 518n-2 fingerprint detector.
+    """
+    model = str(body.get("model") or "").lower()
+    is_model = model in ZERO_RETRY_MODELS or any(
+        model.startswith(f"{known}-") for known in ZERO_RETRY_MODELS
+    )
+    return tokens == 0 and is_model and requested_effort(body) in ZERO_RETRY_EFFORTS
 
 
 # --- continuation payload ----------------------------------------------------
@@ -380,19 +418,40 @@ async def fold(
             first_usage = usage
         rt = reasoning_tokens(usage)
         n = tier_n(rt)
-        rounds_info.append({"round": round_no, "reasoning_tokens": rt, "n": n})
+        buffered_types = [e["item"].get("type") for e in buffered]
+        zero_retry = (
+            should_retry_zero_reasoning(base_body, rt)
+            # Do not retry Codex prewarm/generate probes or empty-output rounds.
+            and bool(orig_input)
+            and bool(buffered_types)
+            # Retrying a zero-reasoning round that emitted a tool/function call
+            # can create an unresolved call with no matching tool output. Keep
+            # the zero-retry path message-only; the 518n-2 path remains governed
+            # by encrypted reasoning instead.
+            and all(t == "message" for t in buffered_types)
+        )
+        rounds_info.append({
+            "round": round_no,
+            "reasoning_tokens": rt,
+            "n": n,
+            "zero_reasoning_retry": zero_retry,
+        })
         has_enc = bool(round_reasoning and round_reasoning[-1].get("encrypted_content"))
 
-        do_continue = (
+        terminal_completed = (
             terminal is not None
             and terminal.get("type") == "response.completed"
             and ((terminal.get("response") or {}).get("status") in (None, "completed"))
-            and in_continue_window(n)
-            and has_enc
+        )
+        do_continue = (
+            terminal_completed
+            and ((in_continue_window(n) and has_enc) or zero_retry)
             and round_no <= MAX_CONTINUE
         )
         stopped_reason = None
-        if not do_continue and n is not None:
+        if terminal_completed and not do_continue and zero_retry:
+            stopped_reason = "zero_reasoning_max_continue"
+        elif not do_continue and n is not None:
             stopped_reason = (
                 "no_encrypted_content" if not has_enc
                 else "max_continue" if round_no > MAX_CONTINUE
@@ -400,9 +459,9 @@ async def fold(
             )
 
         log.info(
-            "round %d: %s | n=%s buffered=%s -> %s",
-            round_no, _fmt(usage), n,
-            [e["item"].get("type") for e in buffered],
+            "round %d: %s | n=%s zero_retry=%s buffered=%s -> %s",
+            round_no, _fmt(usage), n, zero_retry,
+            buffered_types,
             "continue" if do_continue else
             "upstream_eof" if terminal is None else stopped_reason or "clean",
         )

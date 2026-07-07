@@ -7,10 +7,66 @@ import json
 from types import SimpleNamespace
 
 import codexcomp.server as server
-from codexcomp.fold import DONE, RoundOpenError, fold, STEP
+from codexcomp.fold import (
+    DONE,
+    RoundOpenError,
+    fold,
+    requested_effort,
+    should_retry_zero_reasoning,
+    STEP,
+)
 from codexcomp.server import parse_sse
 from starlette.websockets import WebSocketDisconnect
 from websockets.protocol import State
+
+
+def message_round(
+    rid: str,
+    reasoning_toks: int,
+    text: str,
+    resp_id: str = "resp_1",
+):
+    """Canned upstream events for a message-only round."""
+    msg = {"id": "msg_" + rid, "type": "message", "role": "assistant"}
+    return [
+        {"type": "response.created", "sequence_number": 0,
+         "response": {"id": resp_id, "created_at": 111, "status": "in_progress"}},
+        {"type": "response.in_progress", "sequence_number": 1, "response": {"id": resp_id}},
+        {"type": "response.output_item.added", "output_index": 0, "item": msg},
+        {"type": "response.output_text.delta", "output_index": 0,
+         "item_id": msg["id"], "content_index": 0, "delta": text},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {**msg, "content": [{"type": "output_text", "text": text}]}},
+        {"type": "response.completed", "response": {
+            "id": resp_id, "status": "completed",
+            "usage": {"input_tokens": 100, "output_tokens": reasoning_toks + 20,
+                      "total_tokens": 120 + reasoning_toks,
+                      "output_tokens_details": {"reasoning_tokens": reasoning_toks}},
+        }},
+    ]
+
+
+def function_call_round(
+    rid: str,
+    reasoning_toks: int,
+    resp_id: str = "resp_1",
+):
+    """Canned upstream round that emits a function call with zero/low reasoning."""
+    call = {"id": "fc_" + rid, "type": "function_call", "call_id": "call_" + rid, "name": "noop"}
+    return [
+        {"type": "response.created", "sequence_number": 0,
+         "response": {"id": resp_id, "created_at": 111, "status": "in_progress"}},
+        {"type": "response.in_progress", "sequence_number": 1, "response": {"id": resp_id}},
+        {"type": "response.output_item.added", "output_index": 0, "item": call},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {**call, "arguments": "{}"}},
+        {"type": "response.completed", "response": {
+            "id": resp_id, "status": "completed",
+            "usage": {"input_tokens": 100, "output_tokens": reasoning_toks + 10,
+                      "total_tokens": 110 + reasoning_toks,
+                      "output_tokens_details": {"reasoning_tokens": reasoning_toks}},
+        }},
+    ]
 
 
 def reasoning_round(
@@ -271,6 +327,169 @@ async def main():
     assert len(incremental_opened) == 2, incremental_opened
     inc_terms = [e for e in incremental_out if isinstance(e, dict) and e.get("type") == "response.incomplete"]
     assert inc_terms and inc_terms[-1]["response"]["incomplete_details"]["reason"] == "upstream_error"
+
+    # High-effort gpt-5.5 zero-reasoning rounds are suspicious too: retry them
+    # through the same bounded fold path, while still using the safe current
+    # response id + nudge-only continuation strategy.
+    zero_opened = []
+    zero_rounds = [
+        message_round("zero", 0, "ZERO ANSWER", resp_id="resp_zero_1"),
+        message_round("clean", 123, "REAL ANSWER", resp_id="resp_zero_2"),
+    ]
+
+    async def zero_opener(body):
+        zero_opened.append(body)
+        idx = len(zero_opened) - 1
+
+        async def gen():
+            for ev in zero_rounds[idx]:
+                yield ev
+        return gen()
+
+    zero_out = []
+    async for ev in fold({
+        "model": "gpt-5.5",
+        "reasoning": {"effort": "high"},
+        "previous_response_id": "resp_zero_prev",
+        "input": [{"type": "message", "role": "user"}],
+    }, zero_opener):
+        zero_out.append(ev)
+    assert len(zero_opened) == 2, zero_opened
+    assert zero_opened[1]["previous_response_id"] == "resp_zero_1"
+    assert [i.get("type") for i in zero_opened[1]["input"]] == ["message"]
+    zero_deltas = [
+        e["delta"] for e in zero_out
+        if isinstance(e, dict) and e.get("type") == "response.output_text.delta"
+    ]
+    assert zero_deltas == ["REAL ANSWER"], zero_deltas
+    zero_terms = [
+        e for e in zero_out
+        if isinstance(e, dict) and e.get("type") == "response.completed"
+    ]
+    assert [r["zero_reasoning_retry"] for r in zero_terms[-1]["response"]["metadata"]["proxy_rounds"]] == [True, False]
+
+    # The zero-reasoning retry is narrow: not medium effort, not other models.
+    assert requested_effort({"reasoning": {"effort": "extra high"}}) == "extra_high"
+    assert requested_effort({"reasoning": {"effort": "x-high"}}) == "x_high"
+    assert should_retry_zero_reasoning({
+        "model": "gpt-5.5-2026-07-06",
+        "reasoning": {"effort": "extra-high"},
+    }, 0)
+    assert not should_retry_zero_reasoning({"model": "gpt-5.5", "reasoning": {"effort": "medium"}}, 0)
+    assert not should_retry_zero_reasoning({"model": "gpt-5.4", "reasoning": {"effort": "high"}}, 0)
+
+    medium_opened = []
+
+    async def medium_opener(body):
+        medium_opened.append(body)
+
+        async def gen():
+            for ev in [*message_round("medium", 0, "ZERO MEDIUM", resp_id="resp_medium")]:
+                yield ev
+        return gen()
+
+    medium_out = []
+    async for ev in fold({
+        "model": "gpt-5.5",
+        "reasoning": {"effort": "medium"},
+        "input": [{"type": "message", "role": "user"}],
+    }, medium_opener):
+        medium_out.append(ev)
+    assert len(medium_opened) == 1, medium_opened
+    medium_deltas = [
+        e["delta"] for e in medium_out
+        if isinstance(e, dict) and e.get("type") == "response.output_text.delta"
+    ]
+    assert medium_deltas == ["ZERO MEDIUM"], medium_deltas
+
+    # Empty-output/prewarm-style zero-reasoning rounds are not retried.
+    empty_opened = []
+
+    async def empty_opener(body):
+        empty_opened.append(body)
+
+        async def gen():
+            yield {"type": "response.created", "response": {"id": "resp_empty", "status": "in_progress"}}
+            yield {"type": "response.completed", "response": {
+                "id": "resp_empty", "status": "completed",
+                "usage": {"input_tokens": 10, "output_tokens": 0, "total_tokens": 10,
+                          "output_tokens_details": {"reasoning_tokens": 0}},
+            }}
+        return gen()
+
+    empty_out = []
+    async for ev in fold({
+        "model": "gpt-5.5",
+        "reasoning": {"effort": "high"},
+        "input": [],
+        "generate": True,
+    }, empty_opener):
+        empty_out.append(ev)
+    assert len(empty_opened) == 1, empty_opened
+
+    # Zero-reasoning function-call rounds are not retried: a retry would create
+    # an unresolved tool call with no matching function_call_output.
+    call_opened = []
+
+    async def call_opener(body):
+        call_opened.append(body)
+
+        async def gen():
+            for ev in function_call_round("zero_call", 0, resp_id="resp_zero_call"):
+                yield ev
+        return gen()
+
+    call_out = []
+    async for ev in fold({
+        "model": "gpt-5.5",
+        "reasoning": {"effort": "high"},
+        "previous_response_id": "resp_call_prev",
+        "input": [{"type": "message", "role": "user"}],
+    }, call_opener):
+        call_out.append(ev)
+    assert len(call_opened) == 1, call_opened
+    call_terms = [
+        e for e in call_out
+        if isinstance(e, dict) and e.get("type") == "response.completed"
+    ]
+    assert call_terms[-1]["response"]["metadata"]["proxy_rounds"][-1]["zero_reasoning_retry"] is False
+
+    # Repeated zero-reasoning rounds respect MAX_CONTINUE and then flush the
+    # final bounded attempt with metadata explaining the stop reason.
+    repeated_opened = []
+    repeated_rounds = [
+        message_round("zero1", 0, "ZERO 1", resp_id="resp_z1"),
+        message_round("zero2", 0, "ZERO 2", resp_id="resp_z2"),
+        message_round("zero3", 0, "ZERO 3", resp_id="resp_z3"),
+        message_round("zero4", 0, "ZERO 4", resp_id="resp_z4"),
+    ]
+
+    async def repeated_opener(body):
+        repeated_opened.append(body)
+        idx = len(repeated_opened) - 1
+
+        async def gen():
+            for ev in repeated_rounds[idx]:
+                yield ev
+        return gen()
+
+    repeated_out = []
+    async for ev in fold({
+        "model": "gpt-5.5",
+        "reasoning": {"effort": "high"},
+        "previous_response_id": "resp_zprev",
+        "input": [{"type": "message", "role": "user"}],
+    }, repeated_opener):
+        repeated_out.append(ev)
+    assert len(repeated_opened) == 4, repeated_opened
+    repeated_terms = [
+        e for e in repeated_out
+        if isinstance(e, dict) and e.get("type") == "response.completed"
+    ]
+    repeated_term = repeated_terms[-1]["response"]
+    assert repeated_term["metadata"]["proxy_stopped_reason"] == "zero_reasoning_max_continue"
+    assert [r["zero_reasoning_retry"] for r in repeated_term["metadata"]["proxy_rounds"]] == [
+        True, True, True, True]
 
     failed_round = reasoning_round("rs_fail", STEP - 2, "FAILED", resp_id="resp_fail")
     failed_round[-1]["type"] = "response.failed"
