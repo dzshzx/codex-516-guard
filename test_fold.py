@@ -5,7 +5,14 @@ Run: uv run python test_fold.py
 import asyncio
 import json
 
-from codexcomp.fold import DONE, RoundOpenError, fold, STEP
+from codexcomp.fold import (
+    DONE,
+    RoundOpenError,
+    fold,
+    requested_effort,
+    should_retry_zero_reasoning,
+    STEP,
+)
 
 
 def reasoning_round(rid: str, reasoning_toks: int, text: str | None, enc: bool = True):
@@ -39,6 +46,44 @@ def reasoning_round(rid: str, reasoning_toks: int, text: str | None, enc: bool =
     # NB: real upstream sends [DONE] after the terminal event; the fold stops at
     # the terminal, so DONE never reaches it — stream close is the terminator.
     return evs
+
+
+def message_round(rid: str, reasoning_toks: int, text: str):
+    """Canned upstream events for a message-only round."""
+    msg = {"id": "msg_" + rid, "type": "message", "role": "assistant"}
+    return [
+        {"type": "response.created", "sequence_number": 0,
+         "response": {"id": "resp_1", "created_at": 111, "status": "in_progress"}},
+        {"type": "response.in_progress", "sequence_number": 1, "response": {"id": "resp_1"}},
+        {"type": "response.output_item.added", "output_index": 0, "item": msg},
+        {"type": "response.output_text.delta", "output_index": 0,
+         "item_id": msg["id"], "content_index": 0, "delta": text},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {**msg, "content": [{"type": "output_text", "text": text}]}},
+        {"type": "response.completed", "response": {
+            "id": "resp_1", "status": "completed",
+            "usage": {"input_tokens": 100, "output_tokens": reasoning_toks + 20,
+                      "total_tokens": 120 + reasoning_toks,
+                      "output_tokens_details": {"reasoning_tokens": reasoning_toks}},
+        }},
+    ]
+
+
+async def collect_fold(base_body, rounds):
+    """Run fold() against canned rounds and return opened bodies plus events."""
+    opened_bodies = []
+
+    async def opener(body):
+        opened_bodies.append(body)
+        idx = len(opened_bodies) - 1
+
+        async def gen():
+            for ev in rounds[idx]:
+                yield ev
+        return gen()
+
+    out = [ev async for ev in fold(base_body, opener)]
+    return opened_bodies, out
 
 
 async def test_happy_fold():
@@ -173,11 +218,98 @@ async def test_upstream_eof():
     assert deltas == [], deltas
 
 
+async def test_zero_reasoning_retry_for_high_effort_gpt55():
+    """A zero-reasoning high-effort gpt-5.5 round is retried once, and the
+    tentative zero-reasoning answer is not flushed."""
+    base = {
+        "model": "gpt-5.5",
+        "reasoning": {"effort": "extra high"},
+        "input": [{"type": "message", "role": "user"}],
+        "stream": True,
+    }
+    opened_bodies, out = await collect_fold(base, [
+        message_round("zero", 0, "ZERO ANSWER"),
+        message_round("clean", 123, "REAL ANSWER"),
+    ])
+
+    assert len(opened_bodies) == 2, len(opened_bodies)
+    b2 = opened_bodies[1]
+    assert [i.get("type") for i in b2["input"]] == ["message", "message"]
+    assert b2["input"][-1]["phase"] == "commentary"
+    assert "reasoning.encrypted_content" in b2["include"]
+
+    dict_events = [e for e in out if isinstance(e, dict)]
+    deltas = [e["delta"] for e in dict_events if e["type"] == "response.output_text.delta"]
+    assert deltas == ["REAL ANSWER"], deltas
+
+    term = dict_events[-1]["response"]
+    assert [r["zero_reasoning_retry"] for r in term["metadata"]["proxy_rounds"]] == [
+        True, False]
+    assert term["usage"]["output_tokens_details"]["reasoning_tokens"] == 123
+
+
+async def test_zero_reasoning_retry_is_narrowly_gated():
+    """Zero-reasoning retry should not apply to every model or effort."""
+    assert requested_effort({"reasoning": {"effort": "extra high"}}) == "extra_high"
+    assert requested_effort({"reasoning": {"effort": " extra high "}}) == "extra_high"
+    assert requested_effort({"reasoning": {"effort": "extra-high"}}) == "extra_high"
+    assert requested_effort({"reasoning": {"effort": "extraHigh"}}) == "extrahigh"
+    assert requested_effort({"reasoning": {"effort": "x-high"}}) == "x_high"
+    assert should_retry_zero_reasoning(
+        {"model": "gpt-5.5-2026-07-06", "reasoning": {"effort": "x-high"}}, 0)
+    assert not should_retry_zero_reasoning(
+        {"model": "gpt-5.4", "reasoning": {"effort": "high"}}, 0)
+
+    base = {
+        "model": "gpt-5.5",
+        "reasoning": {"effort": "medium"},
+        "input": [{"type": "message", "role": "user"}],
+        "stream": True,
+    }
+    opened_bodies, out = await collect_fold(base, [
+        message_round("medium", 0, "ZERO MEDIUM"),
+    ])
+
+    assert len(opened_bodies) == 1, len(opened_bodies)
+    deltas = [e["delta"] for e in out
+              if isinstance(e, dict) and e["type"] == "response.output_text.delta"]
+    assert deltas == ["ZERO MEDIUM"], deltas
+
+
+async def test_repeated_zero_reasoning_respects_continue_cap():
+    """Repeated zero-reasoning rounds stop at MAX_CONTINUE, same as 518n-2
+    continuations do."""
+    base = {
+        "model": "gpt-5.5",
+        "reasoning": {"effort": "high"},
+        "input": [{"type": "message", "role": "user"}],
+        "stream": True,
+    }
+    opened_bodies, out = await collect_fold(base, [
+        message_round("zero1", 0, "ZERO 1"),
+        message_round("zero2", 0, "ZERO 2"),
+        message_round("zero3", 0, "ZERO 3"),
+        message_round("zero4", 0, "ZERO 4"),
+    ])
+
+    assert len(opened_bodies) == 4, len(opened_bodies)
+    dict_events = [e for e in out if isinstance(e, dict)]
+    deltas = [e["delta"] for e in dict_events if e["type"] == "response.output_text.delta"]
+    assert deltas == ["ZERO 4"], deltas
+    term = dict_events[-1]["response"]
+    assert term["metadata"]["proxy_stopped_reason"] == "zero_reasoning_max_continue"
+    assert [r["zero_reasoning_retry"] for r in term["metadata"]["proxy_rounds"]] == [
+        True, True, True, True]
+
+
 async def main():
     await test_happy_fold()
     await test_round1_rejected()
     await test_continuation_open_fails()
     await test_upstream_eof()
+    await test_zero_reasoning_retry_for_high_effort_gpt55()
+    await test_zero_reasoning_retry_is_narrowly_gated()
+    await test_repeated_zero_reasoning_respects_continue_cap()
     print("fold self-test: ALL PASS")
 
 

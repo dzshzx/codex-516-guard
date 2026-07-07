@@ -46,6 +46,9 @@ downstream response — Codex sees one complete, untruncated answer.
 
 - **Detect → continue → fold** — spots the `518n−2` fingerprint, replays the round's
   reasoning with a continue nudge, and folds all rounds into one response.
+- **Narrow zero-reasoning retry** — for high-effort gpt-5.5 rounds that terminate with
+  `reasoning_tokens == 0`, retries through the same bounded fold path
+  ([details](docs/zero-reasoning-retry.md)).
 - **Zero-footprint wiring** — one official top-level `openai_base_url` key; no
   `[model_providers]` entry, no provider id change, no session re-bucketing.
 - **WebSocket-first transport** — native `responses_websockets` protocol (envelope frames,
@@ -87,7 +90,9 @@ That's it. Disable by removing that line and stopping the proxy; upgrade / unins
 A state machine (`codexcomp/fold.py`) runs per round:
 
 1. **Detect** — `reasoning_tokens == 518n − 2` (`1 ≤ n ≤ 6`, ≤ 3 continuations) marks the
-   round as truncated.
+   round as truncated. A separate narrow gate also retries high-effort gpt-5.5 rounds that
+   terminate with zero reasoning tokens
+   ([details](docs/zero-reasoning-retry.md)).
 2. **Continue** — discard the tentative output and replay the round's reasoning items (incl.
    `encrypted_content`) plus one `phase:"commentary"` `"Continue thinking..."` message as the
    next input.
@@ -146,7 +151,7 @@ done: 3 round(s) | ... | status=completed stop=natural
 
 **Does it touch normal turns?**
 No. Clean rounds pass through byte-for-byte; the fold path only engages on a detected
-`518n−2` truncation.
+`518n−2` truncation or the narrowly gated high-effort gpt-5.5 zero-reasoning case.
 
 **What does a fold cost?**
 Continuation rounds spend extra real tokens, bounded by the `n` window (`1 ≤ n ≤ 6`) and a
