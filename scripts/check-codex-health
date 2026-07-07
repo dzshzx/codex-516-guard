@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Combined codexcomp/Codex health and reasoning-token summary.
+
+Prints metadata only: no prompts, assistant text, tool args, cookies, or auth.
+
+Usage:
+  scripts/check-codex-health
+  scripts/check-codex-health --since '30 minutes ago' --jsonl-minutes 30
+  scripts/check-codex-health --recent-rounds 20 --recent-token-counts 20
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import statistics
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+STEP = 518
+DEFAULT_UNIT = "codexcomp.service"
+DEFAULT_HEALTH_URL = "http://127.0.0.1:8788/healthz"
+SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
+
+ROUND_RE = re.compile(
+    r"codexcomp\.fold:round (?P<round_no>\d+): "
+    r"in=(?P<input>\d+|None) out=(?P<output>\d+|None) "
+    r"reason=(?P<reason>\d+|None) total=(?P<total>\d+|None).*?"
+    r"n=(?P<n>\S+) zero_retry=(?P<zero_retry>\S+).*?"
+    r"buffered=\[(?P<buffered>[^\]]*)\].*? -> (?P<decision>[A-Za-z0-9_]+)"
+)
+
+
+def run(cmd: list[str]) -> str:
+    cp = subprocess.run(cmd, text=True, capture_output=True)
+    return cp.stdout or ""
+
+
+def num(value: str) -> int | None:
+    return None if value == "None" else int(value)
+
+
+def is_518n_minus_2(value: int | None) -> bool:
+    return value is not None and value >= STEP - 2 and (value + 2) % STEP == 0
+
+
+def parse_iso(ts: str | None) -> float | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def percentile(values: list[int], p: float) -> int | None:
+    if not values:
+        return None
+    values = sorted(values)
+    idx = int(p * (len(values) - 1))
+    return values[idx]
+
+
+def print_service(unit: str, health_url: str) -> None:
+    print("--- service ---")
+    show = run(["systemctl", "--user", "show", unit, "-p", "ActiveState", "-p", "MainPID", "--no-pager"])
+    print(show.strip() or "systemctl_show_unavailable")
+    try:
+        body = urllib.request.urlopen(health_url, timeout=2).read().decode()
+        print("health=" + body)
+    except Exception as exc:
+        print(f"health_error={exc!r}")
+
+
+def parse_journal(unit: str, since: str) -> tuple[str, list[dict[str, Any]], dict[str, int]]:
+    text = run(["journalctl", "--user", "-u", unit, "--since", since, "--no-pager"])
+    counters = {
+        "creates": text.count("codexcomp.server:ws response.create"),
+        "prev_yes": len(re.findall(r"ws response\.create: .*previous_response_id=yes", text)),
+        "prev_no": len(re.findall(r"ws response\.create: .*previous_response_id=no", text)),
+        "connected": text.count("upstream websocket connected: status=101"),
+        "upstream_rounds": text.count("codexcomp.server:open upstream websocket round"),
+        "first_events": text.count("codexcomp.server:upstream websocket first event"),
+        "completed": text.count("upstream websocket terminal: type=response.completed status=completed"),
+        "continue_decisions": len(re.findall(r"codexcomp\.fold:round \d+: .*-> continue", text)),
+        "continuation_opens": text.count("codexcomp.fold:open continuation"),
+        "server_error_frames": text.count("codexcomp.server:upstream websocket error frame"),
+        "server_timeouts": text.count("codexcomp.server:upstream websocket timed out"),
+        "fold_midstream_errors": len(re.findall(r"codexcomp\.fold:round \d+: upstream error mid-stream", text)),
+        "previous_response_not_found": text.count("previous_response_not_found"),
+        "no_tool_output": text.count("No tool output found"),
+        "response_active": text.count("response_active"),
+        "tracebacks": text.count("Traceback"),
+    }
+    rounds: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        m = ROUND_RE.search(line)
+        if not m:
+            continue
+        rounds.append({
+            "round_no": int(m.group("round_no")),
+            "input": num(m.group("input")),
+            "output": num(m.group("output")),
+            "reason": num(m.group("reason")),
+            "total": num(m.group("total")),
+            "n": m.group("n"),
+            "zero_retry": m.group("zero_retry") == "True",
+            "buffered": m.group("buffered"),
+            "decision": m.group("decision"),
+        })
+    return text, rounds, counters
+
+
+def print_proxy_summary(rounds: list[dict[str, Any]], counters: dict[str, int], recent_rounds: int) -> list[str]:
+    print("\n--- proxy ---")
+    for key in (
+        "creates", "prev_yes", "prev_no", "connected", "upstream_rounds", "first_events", "completed",
+        "continue_decisions", "continuation_opens", "server_error_frames", "server_timeouts",
+        "fold_midstream_errors", "previous_response_not_found", "no_tool_output", "response_active", "tracebacks",
+    ):
+        print(f"{key}={counters[key]}")
+
+    reasons = [r["reason"] for r in rounds if r["reason"] is not None]
+    nonzero = [r for r in reasons if r > 0]
+    clusters = {str(k): sum(1 for r in reasons if r == k) for k in (516, 1034, 1552, 2070, 2588, 3106)}
+    print("\n--- proxy reasoning ---")
+    print(f"round_lines={len(rounds)}")
+    print(f"reason_sum={sum(reasons) if reasons else 0}")
+    print(f"zero_reason_rounds={sum(1 for r in reasons if r == 0)}")
+    print(f"nonzero_reason_rounds={len(nonzero)}")
+    print(f"max_reason={max(reasons) if reasons else 0}")
+    print(f"nonzero_median={statistics.median(nonzero) if nonzero else None}")
+    print(f"nonzero_p90={percentile(nonzero, 0.90)}")
+    print("518n_minus_2_clusters=" + json.dumps(clusters))
+    print(f"handled_518n_minus_2={bool(any(clusters.values()) and counters['continuation_opens'])}")
+    print(f"zero_retry_true={sum(1 for r in rounds if r['zero_retry'])}")
+
+    print(f"\n--- recent proxy rounds metadata last {recent_rounds} ---")
+    for r in rounds[-recent_rounds:]:
+        print(json.dumps(r, ensure_ascii=False))
+
+    warnings: list[str] = []
+    for key in ("server_error_frames", "server_timeouts", "fold_midstream_errors", "previous_response_not_found", "no_tool_output", "response_active", "tracebacks"):
+        if counters[key]:
+            warnings.append(f"{key}={counters[key]}")
+    if any(clusters.values()) and not counters["continuation_opens"]:
+        warnings.append("unhandled_518n_minus_2_cluster_seen=" + json.dumps(clusters))
+    if counters["continuation_opens"] and counters["previous_response_not_found"]:
+        warnings.append("continuation_with_previous_response_not_found")
+    if any(r["zero_retry"] for r in rounds):
+        warnings.append("zero_retry_seen")
+    return warnings
+
+
+def iter_recent_jsonl(minutes: int) -> list[Path]:
+    cut = time.time() - minutes * 60
+    if not SESSIONS_ROOT.exists():
+        return []
+    files = [p for p in SESSIONS_ROOT.glob("**/*.jsonl") if p.stat().st_mtime >= cut]
+    return sorted(files, key=lambda p: p.stat().st_mtime)
+
+
+def parse_jsonl_tokens(minutes: int) -> list[dict[str, Any]]:
+    cut = time.time() - minutes * 60
+    events: list[dict[str, Any]] = []
+    for path in iter_recent_jsonl(minutes):
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except Exception:
+            continue
+        sid = path.stem.replace("rollout-", "")
+        for line_no, line in enumerate(lines, 1):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            ts = obj.get("timestamp")
+            epoch = parse_iso(ts)
+            if epoch is not None and epoch < cut:
+                continue
+            payload = obj.get("payload") or {}
+            if payload.get("type") != "token_count":
+                continue
+            last = ((payload.get("info") or {}).get("last_token_usage") or {})
+            if not last:
+                continue
+            events.append({
+                "ts": ts,
+                "session": sid[:8] + "…",
+                "line": line_no,
+                "input": last.get("input_tokens"),
+                "cached": last.get("cached_input_tokens"),
+                "output": last.get("output_tokens"),
+                "reason": last.get("reasoning_output_tokens"),
+                "total": last.get("total_tokens"),
+            })
+    events.sort(key=lambda e: e.get("ts") or "")
+    return events
+
+
+def print_jsonl_summary(events: list[dict[str, Any]], recent_token_counts: int, minutes: int) -> None:
+    print(f"\n--- codex JSONL token_count last {minutes}m ---")
+    reasons = [int(e.get("reason") or 0) for e in events]
+    nonzero = [r for r in reasons if r > 0]
+    print(f"token_count_events={len(events)}")
+    print(f"jsonl_reason_sum={sum(reasons)}")
+    print(f"zero={sum(1 for r in reasons if r == 0)}")
+    print(f"nonzero={len(nonzero)}")
+    print(f"max={max(reasons) if reasons else 0}")
+    print(f"nonzero_median={statistics.median(nonzero) if nonzero else None}")
+    print(f"nonzero_p90={percentile(nonzero, 0.90)}")
+    print(f"\n--- recent token_count metadata last {recent_token_counts} ---")
+    for e in events[-recent_token_counts:]:
+        print(json.dumps(e, ensure_ascii=False))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Combined codexcomp health/reasoning diagnostics")
+    ap.add_argument("--since", default="30 minutes ago", help="journalctl --since value")
+    ap.add_argument("--unit", default=DEFAULT_UNIT)
+    ap.add_argument("--health-url", default=DEFAULT_HEALTH_URL)
+    ap.add_argument("--jsonl-minutes", type=int, default=30)
+    ap.add_argument("--recent-rounds", type=int, default=12)
+    ap.add_argument("--recent-token-counts", type=int, default=12)
+    args = ap.parse_args()
+
+    print(f"now={datetime.now().strftime('%F %T')}")
+    print(f"since={args.since}")
+    print_service(args.unit, args.health_url)
+    _text, rounds, counters = parse_journal(args.unit, args.since)
+    warnings = print_proxy_summary(rounds, counters, args.recent_rounds)
+    events = parse_jsonl_tokens(args.jsonl_minutes)
+    print_jsonl_summary(events, args.recent_token_counts, args.jsonl_minutes)
+
+    print("\n--- verdict ---")
+    if warnings:
+        print("status=WARN")
+        for item in warnings:
+            print("warn=" + item)
+    else:
+        print("status=OK")
+    return 0 if not warnings else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
