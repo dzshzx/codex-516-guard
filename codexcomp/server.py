@@ -19,13 +19,12 @@ transport-agnostic.
 """
 from __future__ import annotations
 
-import asyncio
 import gzip
 import json
 import logging
 import os
 import zlib
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator
 
 import httpx
 import zstandard
@@ -39,9 +38,6 @@ from . import DEFAULT_UPSTREAM
 from .fold import DONE, RoundOpenError, fold
 
 log = logging.getLogger("codexcomp.server")
-
-_UPSTREAM_TRANSPORT_ATTEMPTS = 3
-_UPSTREAM_TRANSPORT_RETRY_BASE_SEC = 0.2
 
 # hop-by-hop / transport-specific headers never forwarded upstream
 _DROP_HEADERS = {
@@ -66,24 +62,6 @@ def upstream_headers(raw: Any) -> dict[str, str]:
 
 def _http_error_detail(exc: httpx.HTTPError) -> str:
     return str(exc) or repr(exc.__cause__) or repr(exc)
-
-
-async def _with_transport_retries(
-    label: str,
-    send: Callable[[], Awaitable[httpx.Response]],
-) -> httpx.Response:
-    for attempt in range(1, _UPSTREAM_TRANSPORT_ATTEMPTS + 1):
-        try:
-            return await send()
-        except httpx.HTTPError as exc:
-            if attempt >= _UPSTREAM_TRANSPORT_ATTEMPTS:
-                raise
-            log.warning(
-                "%s upstream transport error (%d/%d): %s; retrying",
-                label, attempt, _UPSTREAM_TRANSPORT_ATTEMPTS, _http_error_detail(exc),
-            )
-            await asyncio.sleep(_UPSTREAM_TRANSPORT_RETRY_BASE_SEC * attempt)
-    raise RuntimeError("unreachable upstream retry loop")
 
 
 def decompress_body(data: bytes, encoding: str | None) -> bytes:
@@ -165,14 +143,15 @@ class UpstreamRounds:
             timeout=httpx.Timeout(connect=30, read=600, write=60, pool=30),
         )
         try:
-            resp = await _with_transport_retries(
-                "responses round open",
-                lambda: self.client.send(req, stream=True),
-            )
+            resp = await self.client.send(req, stream=True)
         except httpx.HTTPError as exc:
+            # No retry: send() may fail after the request reached the upstream
+            # (e.g. ReadTimeout), and a re-send would double-generate the turn.
             detail = _http_error_detail(exc)
+            log.warning("round open upstream transport error: %s: %s",
+                        type(exc).__name__, detail)
             raise RoundOpenError(
-                599,
+                502,
                 f"{type(exc).__name__}: {detail}",
                 code="upstream_connection_error",
             ) from exc
@@ -444,12 +423,9 @@ async def passthrough(request: Request) -> Response:
         content = decompress_body(content, request.headers.get("content-encoding"))
     headers = upstream_headers(request.headers.raw)
     try:
-        upstream = await _with_transport_retries(
-            f"passthrough {request.method} /v1/{suffix}",
-            lambda: request.app.state.client.request(
-                request.method, url, content=content or None, headers=headers,
-                timeout=httpx.Timeout(60),
-            ),
+        upstream = await request.app.state.client.request(
+            request.method, url, content=content or None, headers=headers,
+            timeout=httpx.Timeout(60),
         )
     except httpx.HTTPError as exc:
         detail = _http_error_detail(exc)

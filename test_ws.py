@@ -181,7 +181,7 @@ def test_ws_connect_error_yields_failed_terminal():
         assert err["code"] == "upstream_connection_error"
         assert "ConnectError" in err["message"]
         assert "proxy TLS failed" in err["message"]
-        assert len(upstream_calls) == 3
+        assert len(upstream_calls) == 1  # no retry: a re-send could double-generate
 
 
 def test_post_sse_unchanged():
