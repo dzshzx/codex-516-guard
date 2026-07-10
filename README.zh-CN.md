@@ -188,10 +188,12 @@ codexcomp-sudoku-eval -r xhigh,ultra,max        # 长推理压力矩阵
 记于 `metadata.proxy_billed_usage`。
 
 **gpt-5.6 系列还能用吗？**
-能——`518n−2` 格点在 gpt-5.6 上依然出现，折叠与 gpt-5.5 上完全一致地介入。但 5.6 的
-正确率下滑大部分（尤其 `terra` 在 `max` 以下档位、以及 `luna`）是另一种失败形态：
-reasoning 坍缩到几百 token 且落在*非格点*值上——是真实的欠思考而非截断，任何代理都
-无法检测或修复。矩阵数据见 [#11](https://github.com/dzshzx/codexcomp/issues/11)。
+机制上能——`518n−2` 格点在 gpt-5.6 上依然出现，折叠也与 gpt-5.5 上完全一致地介入——
+但它不再带来正确率收益：192 跑 A/B 矩阵中走代理与直连的正确率完全相同。5.6 命中格点
+时答案通常已经完整，而 5.6 真正的失分（reasoning 坍缩到几百 token 的*非格点*值——欠
+思考而非截断）任何代理都看不见。只用 5.6 的话建议删掉 `openai_base_url` 接线（折叠只
+会多花 token 无收益）；对 gpt-5.5 项目依然完全有效。矩阵数据见
+[#11](https://github.com/dzshzx/codexcomp/issues/11)。
 
 **上游修复之后怎么办？**
 无需任何操作——检测器不再命中，代理退化为透明透传。随时删除 `openai_base_url` 行即可脱线。

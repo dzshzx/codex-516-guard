@@ -205,10 +205,12 @@ Continuation rounds spend extra real tokens, bounded by the continuation cap
 `metadata.proxy_billed_usage`.
 
 **Does it work with the gpt-5.6 series?**
-Yes — the `518n−2` lattice still appears on gpt-5.6 and folding engages exactly as on
-gpt-5.5. But much of the 5.6 accuracy drop (notably `terra` below `max` effort, and `luna`)
-is a different failure mode: reasoning collapses to a few hundred tokens at *non-lattice*
-values — legitimate under-thinking, not truncation — which no proxy can detect or fix.
+Mechanically yes — the `518n−2` lattice still appears on gpt-5.6 and folding engages exactly
+as on gpt-5.5 — but it no longer buys accuracy: in a 192-run A/B grid, proxied and direct
+accuracy were identical. A 5.6 run that hits the lattice usually has a complete answer
+already, and 5.6's real losses (reasoning collapsing to a few hundred tokens at *non-lattice*
+values — under-thinking, not truncation) are invisible to any proxy. If you only use 5.6,
+unwire codexcomp (folds just spend extra tokens); it remains fully effective for gpt-5.5.
 Grid data in [#11](https://github.com/dzshzx/codexcomp/issues/11).
 
 **What happens when OpenAI fixes this upstream?**
