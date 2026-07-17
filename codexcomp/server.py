@@ -156,7 +156,11 @@ class UpstreamRounds:
             "POST", self.responses_url,
             content=json.dumps(body, ensure_ascii=False).encode(),
             headers=headers,
-            timeout=httpx.Timeout(connect=30, read=600, write=60, pool=30),
+            # read= bounds the gap between consecutive bytes, not the stream's
+            # total duration: across 21 live-verified rounds the longest healthy
+            # silence was 30.74s. 120 keeps a blackholed proxy path from pinning
+            # a pool connection for 10 minutes (#8).
+            timeout=httpx.Timeout(connect=30, read=120, write=60, pool=30),
         )
         request_id = next(_REQUEST_IDS)
         self._active_request_id = request_id
