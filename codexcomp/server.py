@@ -40,126 +40,13 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import DEFAULT_UPSTREAM
 from .fold import DONE, RoundOpenError, fold
+from .pool import (POOL_MAX_CONNECTIONS, lease_upstream_client, new_http_client,
+                   pool_snapshot, proxy_summary, recover_upstream_client,
+                   release_upstream_client)
 
 log = logging.getLogger("codexcomp.server")
 
 _REQUEST_IDS = count(1)
-_POOL_MAX_CONNECTIONS = 100
-
-
-def _new_http_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        trust_env=True,
-        http2=False,
-        limits=httpx.Limits(
-            max_connections=_POOL_MAX_CONNECTIONS,
-            max_keepalive_connections=20,
-            keepalive_expiry=5,
-        ),
-    )
-
-
-def _proxy_summary() -> str:
-    """Describe proxy routing without ever logging credentials."""
-    from urllib.parse import urlsplit
-
-    configured = []
-    for key in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY",
-                "all_proxy", "https_proxy", "http_proxy"):
-        raw = os.environ.get(key)
-        if not raw:
-            continue
-        parsed = urlsplit(raw)
-        configured.append(
-            f"{key}={parsed.scheme}://{parsed.hostname}:{parsed.port}")
-    return ",".join(configured) or "direct"
-
-
-def _pool_snapshot(client: httpx.AsyncClient) -> str:
-    """Best-effort httpcore snapshot used only for failure diagnostics."""
-    transports = [getattr(client, "_transport", None)]
-    transports.extend(getattr(client, "_mounts", {}).values())
-    seen: set[int] = set()
-    pools = []
-    for transport in transports:
-        if transport is None or id(transport) in seen:
-            continue
-        seen.add(id(transport))
-        pool = getattr(transport, "_pool", None)
-        connections = list(getattr(pool, "connections", ()) or ())
-        if pool is None:
-            continue
-        try:
-            idle = sum(conn.is_idle() for conn in connections)
-            available = sum(conn.is_available() for conn in connections)
-        except (AttributeError, TypeError):
-            pools.append(f"total={len(connections)}")
-            continue
-        active = len(connections) - idle
-        pools.append(
-            f"total={len(connections)} active={active} idle={idle} "
-            f"available={available}")
-    return ";".join(pools) or "unavailable"
-
-
-async def _recover_upstream_client(
-        state: Any, failed_client: httpx.AsyncClient, context: str, reason: str,
-        *, require_no_other_requests: bool = False,
-        current_request_counted: bool = False) -> None:
-    """Rotate a broken pool once; later retries use a clean client immediately."""
-    async with state.client_reset_lock:
-        if state.client is not failed_client:
-            return
-        client_requests = state.client_leases.get(failed_client, 0)
-        other_requests = client_requests - int(current_request_counted)
-        if require_no_other_requests and other_requests > 0:
-            log.warning(
-                "upstream client rotation deferred context=%s reason=%s "
-                "other_active_requests=%d",
-                context, reason, other_requests,
-            )
-            return
-        old_snapshot = _pool_snapshot(failed_client)
-        state.client = state.client_factory()
-        state.client_generation += 1
-        log.error(
-            "rotated upstream client generation=%d context=%s reason=%s "
-            "active_requests=%d other_active_requests=%d old_pool=[%s] proxy=%s",
-            state.client_generation, context, reason,
-            state.upstream_active, other_requests, old_snapshot, _proxy_summary(),
-        )
-        # A retired generation is never reused. Its own final lease closes it;
-        # unrelated requests on newer generations do not delay that cleanup.
-        state.retired_clients.add(failed_client)
-        await _close_unleased_retired_clients(state)
-
-
-async def _close_unleased_retired_clients(state: Any) -> None:
-    retired = tuple(
-        client for client in state.retired_clients
-        if state.client_leases.get(client, 0) == 0
-    )
-    if not retired:
-        return
-    state.retired_clients.difference_update(retired)
-    await asyncio.gather(*(client.aclose() for client in retired),
-                         return_exceptions=True)
-    log.info("closed %d drained upstream client generation(s)", len(retired))
-
-
-def _lease_upstream_client(state: Any, client: httpx.AsyncClient) -> None:
-    state.client_leases[client] = state.client_leases.get(client, 0) + 1
-    state.upstream_active += 1
-
-
-async def _release_upstream_client(state: Any, client: httpx.AsyncClient) -> None:
-    leases = state.client_leases.get(client, 0)
-    if leases <= 1:
-        state.client_leases.pop(client, None)
-    else:
-        state.client_leases[client] = leases - 1
-    state.upstream_active -= 1
-    await _close_unleased_retired_clients(state)
 
 # hop-by-hop / transport-specific headers never forwarded upstream
 _DROP_HEADERS = {
@@ -257,7 +144,7 @@ class UpstreamRounds:
         # Pin the client for the entire fold, not just one HTTP round. A fold
         # may close round N and immediately open N+1 on the same client.
         self._owner_active = True
-        _lease_upstream_client(self.state, self.client)
+        lease_upstream_client(self.state, self.client)
 
     async def open(self, body: dict[str, Any]) -> AsyncIterator[dict | object]:
         await self._close_response()
@@ -290,18 +177,18 @@ class UpstreamRounds:
                 "round open upstream transport error id=%d elapsed=%.3fs "
                 "active=%d generation=%d pool=[%s] proxy=%s: %s: %s",
                 request_id, elapsed, self.state.upstream_active - 1,
-                self.state.client_generation, _pool_snapshot(self.client),
-                _proxy_summary(), type(exc).__name__, detail,
+                self.state.client_generation, pool_snapshot(self.client),
+                proxy_summary(), type(exc).__name__, detail,
             )
             if isinstance(exc, httpx.PoolTimeout):
-                await _recover_upstream_client(
+                await recover_upstream_client(
                     self.state, self.client, "round", "pool-timeout",
                     current_request_counted=True)
             elif isinstance(exc, httpx.ConnectError):
                 # A failed SOCKS/HTTP proxy handshake can remain ACTIVE in
                 # httpcore even though no application request owns it. Rotate
                 # only when doing so cannot interrupt another upstream stream.
-                await _recover_upstream_client(
+                await recover_upstream_client(
                     self.state, self.client, "round", "connect-error",
                     require_no_other_requests=True,
                     current_request_counted=True)
@@ -344,7 +231,7 @@ class UpstreamRounds:
         await self._close_response()
         if self._owner_active:
             self._owner_active = False
-            await _release_upstream_client(self.state, self.client)
+            await release_upstream_client(self.state, self.client)
 
 
 # --- downstream websocket session state ----------------------------------------
@@ -603,7 +490,7 @@ async def passthrough(request: Request) -> Response:
     client = state.client
     request_id = next(_REQUEST_IDS)
     started = time.monotonic()
-    _lease_upstream_client(state, client)
+    lease_upstream_client(state, client)
     try:
         upstream = await client.request(
             request.method, url, content=content or None, headers=headers,
@@ -615,15 +502,15 @@ async def passthrough(request: Request) -> Response:
             "passthrough upstream error id=%d elapsed=%.3fs active=%d "
             "generation=%d pool=[%s] proxy=%s for %s /v1/%s: %s: %s",
             request_id, time.monotonic() - started, state.upstream_active - 1,
-            state.client_generation, _pool_snapshot(client), _proxy_summary(),
+            state.client_generation, pool_snapshot(client), proxy_summary(),
             request.method, suffix, type(exc).__name__, detail,
         )
         if isinstance(exc, httpx.PoolTimeout):
-            await _recover_upstream_client(
+            await recover_upstream_client(
                 state, client, "passthrough", "pool-timeout",
                 current_request_counted=True)
         elif isinstance(exc, httpx.ConnectError):
-            await _recover_upstream_client(
+            await recover_upstream_client(
                 state, client, "passthrough", "connect-error",
                 require_no_other_requests=True, current_request_counted=True)
         return JSONResponse(
@@ -632,7 +519,7 @@ async def passthrough(request: Request) -> Response:
             status_code=502,
         )
     finally:
-        await _release_upstream_client(state, client)
+        await release_upstream_client(state, client)
     drop = {"content-encoding", "transfer-encoding", "connection", "content-length"}
     return Response(
         upstream.content, status_code=upstream.status_code,
@@ -660,7 +547,7 @@ def build_app(upstream_base: str | None = None) -> Starlette:
     async def lifespan(app: Starlette):
         log.info(
             "startup upstream=%s proxy=%s pool_max=%d client_generation=%d",
-            app.state.upstream_base, _proxy_summary(), _POOL_MAX_CONNECTIONS,
+            app.state.upstream_base, proxy_summary(), POOL_MAX_CONNECTIONS,
             app.state.client_generation,
         )
         try:
@@ -668,7 +555,7 @@ def build_app(upstream_base: str | None = None) -> Starlette:
         finally:
             log.info("shutdown active_requests=%d websocket_active=%d pool=[%s]",
                      app.state.upstream_active, app.state.websocket_active,
-                     _pool_snapshot(app.state.client))
+                     pool_snapshot(app.state.client))
             await app.state.client.aclose()
             await asyncio.gather(
                 *(client.aclose() for client in app.state.retired_clients),
@@ -681,7 +568,7 @@ def build_app(upstream_base: str | None = None) -> Starlette:
         Route("/v1/{path:path}", passthrough,
               methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]),
     ], lifespan=lifespan)
-    app.state.client_factory = _new_http_client
+    app.state.client_factory = new_http_client
     app.state.client = app.state.client_factory()
     app.state.client_reset_lock = asyncio.Lock()
     app.state.retired_clients = set()

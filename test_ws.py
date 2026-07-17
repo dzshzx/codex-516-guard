@@ -12,7 +12,8 @@ import json
 import httpx
 from starlette.testclient import TestClient
 
-from codexcomp.server import _close_unleased_retired_clients, build_app
+from codexcomp.pool import close_unleased_retired_clients
+from codexcomp.server import build_app
 
 USER1 = {"type": "message", "role": "user",
          "content": [{"type": "input_text", "text": "hi"}]}
@@ -373,7 +374,7 @@ def test_pool_timeout_does_not_close_another_active_stream():
         assert app.state.upstream_active == 1
         app.state.upstream_active = 0
         app.state.client_leases.clear()
-        client.portal.call(_close_unleased_retired_clients, app.state)
+        client.portal.call(close_unleased_retired_clients, app.state)
         assert failed.is_closed
         assert not app.state.retired_clients
 
