@@ -12,7 +12,7 @@ import json
 import httpx
 from starlette.testclient import TestClient
 
-from codexcomp.server import _close_retired_clients_if_idle, build_app
+from codexcomp.server import _close_unleased_retired_clients, build_app
 
 USER1 = {"type": "message", "role": "user",
          "content": [{"type": "input_text", "text": "hi"}]}
@@ -312,6 +312,7 @@ def test_connect_error_does_not_interrupt_another_active_request():
     app.state.client = httpx.AsyncClient(
         transport=httpx.MockTransport(failing_upstream))
     app.state.upstream_active = 1  # one independently tracked live stream
+    app.state.client_leases[app.state.client] = 1
     client = TestClient(app)
     with client:
         resp = client.get("/v1/models")
@@ -319,6 +320,7 @@ def test_connect_error_does_not_interrupt_another_active_request():
         assert app.state.client_generation == 1
         assert app.state.upstream_active == 1
         app.state.upstream_active = 0
+        app.state.client_leases.clear()
 
 
 def test_pool_timeout_rotates_client_once():
@@ -360,6 +362,7 @@ def test_pool_timeout_does_not_close_another_active_stream():
         transport=httpx.MockTransport(
             lambda request: httpx.Response(200, json={"models": []})))
     app.state.upstream_active = 1  # independently tracked live stream
+    app.state.client_leases[failed] = 1
     client = TestClient(app)
     with client:
         resp = client.get("/v1/models")
@@ -369,7 +372,8 @@ def test_pool_timeout_does_not_close_another_active_stream():
         assert not failed.is_closed
         assert app.state.upstream_active == 1
         app.state.upstream_active = 0
-        client.portal.call(_close_retired_clients_if_idle, app.state)
+        app.state.client_leases.clear()
+        client.portal.call(_close_unleased_retired_clients, app.state)
         assert failed.is_closed
         assert not app.state.retired_clients
 

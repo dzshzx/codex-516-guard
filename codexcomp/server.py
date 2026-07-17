@@ -110,7 +110,8 @@ async def _recover_upstream_client(
     async with state.client_reset_lock:
         if state.client is not failed_client:
             return
-        other_requests = state.upstream_active - int(current_request_counted)
+        client_requests = state.client_leases.get(failed_client, 0)
+        other_requests = client_requests - int(current_request_counted)
         if require_no_other_requests and other_requests > 0:
             log.warning(
                 "upstream client rotation deferred context=%s reason=%s "
@@ -127,23 +128,38 @@ async def _recover_upstream_client(
             state.client_generation, context, reason,
             state.upstream_active, other_requests, old_snapshot, _proxy_summary(),
         )
-        # A retired generation is never reused. Do not close it while another
-        # request may still be streaming from it; the last active request drains
-        # all retired generations below.
-        if other_requests > 0:
-            state.retired_clients.add(failed_client)
-        else:
-            await failed_client.aclose()
+        # A retired generation is never reused. Its own final lease closes it;
+        # unrelated requests on newer generations do not delay that cleanup.
+        state.retired_clients.add(failed_client)
+        await _close_unleased_retired_clients(state)
 
 
-async def _close_retired_clients_if_idle(state: Any) -> None:
-    if state.upstream_active != 0 or not state.retired_clients:
+async def _close_unleased_retired_clients(state: Any) -> None:
+    retired = tuple(
+        client for client in state.retired_clients
+        if state.client_leases.get(client, 0) == 0
+    )
+    if not retired:
         return
-    retired = tuple(state.retired_clients)
-    state.retired_clients.clear()
+    state.retired_clients.difference_update(retired)
     await asyncio.gather(*(client.aclose() for client in retired),
                          return_exceptions=True)
     log.info("closed %d drained upstream client generation(s)", len(retired))
+
+
+def _lease_upstream_client(state: Any, client: httpx.AsyncClient) -> None:
+    state.client_leases[client] = state.client_leases.get(client, 0) + 1
+    state.upstream_active += 1
+
+
+async def _release_upstream_client(state: Any, client: httpx.AsyncClient) -> None:
+    leases = state.client_leases.get(client, 0)
+    if leases <= 1:
+        state.client_leases.pop(client, None)
+    else:
+        state.client_leases[client] = leases - 1
+    state.upstream_active -= 1
+    await _close_unleased_retired_clients(state)
 
 # hop-by-hop / transport-specific headers never forwarded upstream
 _DROP_HEADERS = {
@@ -241,7 +257,7 @@ class UpstreamRounds:
         # Pin the client for the entire fold, not just one HTTP round. A fold
         # may close round N and immediately open N+1 on the same client.
         self._owner_active = True
-        self.state.upstream_active += 1
+        _lease_upstream_client(self.state, self.client)
 
     async def open(self, body: dict[str, Any]) -> AsyncIterator[dict | object]:
         await self._close_response()
@@ -328,8 +344,7 @@ class UpstreamRounds:
         await self._close_response()
         if self._owner_active:
             self._owner_active = False
-            self.state.upstream_active -= 1
-            await _close_retired_clients_if_idle(self.state)
+            await _release_upstream_client(self.state, self.client)
 
 
 # --- downstream websocket session state ----------------------------------------
@@ -588,7 +603,7 @@ async def passthrough(request: Request) -> Response:
     client = state.client
     request_id = next(_REQUEST_IDS)
     started = time.monotonic()
-    state.upstream_active += 1
+    _lease_upstream_client(state, client)
     try:
         upstream = await client.request(
             request.method, url, content=content or None, headers=headers,
@@ -617,8 +632,7 @@ async def passthrough(request: Request) -> Response:
             status_code=502,
         )
     finally:
-        state.upstream_active -= 1
-        await _close_retired_clients_if_idle(state)
+        await _release_upstream_client(state, client)
     drop = {"content-encoding", "transfer-encoding", "connection", "content-length"}
     return Response(
         upstream.content, status_code=upstream.status_code,
@@ -671,6 +685,7 @@ def build_app(upstream_base: str | None = None) -> Starlette:
     app.state.client = app.state.client_factory()
     app.state.client_reset_lock = asyncio.Lock()
     app.state.retired_clients = set()
+    app.state.client_leases = {}
     app.state.client_generation = 1
     app.state.upstream_active = 0
     app.state.websocket_active = 0
