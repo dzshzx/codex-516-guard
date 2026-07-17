@@ -19,10 +19,14 @@ transport-agnostic.
 """
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 import gzip
+from itertools import count
 import json
 import logging
 import os
+import time
 import zlib
 from typing import Any, AsyncIterator
 
@@ -38,6 +42,124 @@ from . import DEFAULT_UPSTREAM
 from .fold import DONE, RoundOpenError, fold
 
 log = logging.getLogger("codexcomp.server")
+
+_REQUEST_IDS = count(1)
+_POOL_MAX_CONNECTIONS = 100
+
+
+def _new_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        trust_env=True,
+        http2=False,
+        limits=httpx.Limits(
+            max_connections=_POOL_MAX_CONNECTIONS,
+            max_keepalive_connections=20,
+            keepalive_expiry=5,
+        ),
+    )
+
+
+def _proxy_summary() -> str:
+    """Describe proxy routing without ever logging credentials."""
+    from urllib.parse import urlsplit
+
+    configured = []
+    for key in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY",
+                "all_proxy", "https_proxy", "http_proxy"):
+        raw = os.environ.get(key)
+        if not raw:
+            continue
+        parsed = urlsplit(raw)
+        configured.append(
+            f"{key}={parsed.scheme}://{parsed.hostname}:{parsed.port}")
+    return ",".join(configured) or "direct"
+
+
+def _pool_snapshot(client: httpx.AsyncClient) -> str:
+    """Best-effort httpcore snapshot used only for failure diagnostics."""
+    transports = [getattr(client, "_transport", None)]
+    transports.extend(getattr(client, "_mounts", {}).values())
+    seen: set[int] = set()
+    pools = []
+    for transport in transports:
+        if transport is None or id(transport) in seen:
+            continue
+        seen.add(id(transport))
+        pool = getattr(transport, "_pool", None)
+        connections = list(getattr(pool, "connections", ()) or ())
+        if pool is None:
+            continue
+        try:
+            idle = sum(conn.is_idle() for conn in connections)
+            available = sum(conn.is_available() for conn in connections)
+        except (AttributeError, TypeError):
+            pools.append(f"total={len(connections)}")
+            continue
+        active = len(connections) - idle
+        pools.append(
+            f"total={len(connections)} active={active} idle={idle} "
+            f"available={available}")
+    return ";".join(pools) or "unavailable"
+
+
+async def _recover_upstream_client(
+        state: Any, failed_client: httpx.AsyncClient, context: str, reason: str,
+        *, require_no_other_requests: bool = False,
+        current_request_counted: bool = False) -> None:
+    """Rotate a broken pool once; later retries use a clean client immediately."""
+    async with state.client_reset_lock:
+        if state.client is not failed_client:
+            return
+        client_requests = state.client_leases.get(failed_client, 0)
+        other_requests = client_requests - int(current_request_counted)
+        if require_no_other_requests and other_requests > 0:
+            log.warning(
+                "upstream client rotation deferred context=%s reason=%s "
+                "other_active_requests=%d",
+                context, reason, other_requests,
+            )
+            return
+        old_snapshot = _pool_snapshot(failed_client)
+        state.client = state.client_factory()
+        state.client_generation += 1
+        log.error(
+            "rotated upstream client generation=%d context=%s reason=%s "
+            "active_requests=%d other_active_requests=%d old_pool=[%s] proxy=%s",
+            state.client_generation, context, reason,
+            state.upstream_active, other_requests, old_snapshot, _proxy_summary(),
+        )
+        # A retired generation is never reused. Its own final lease closes it;
+        # unrelated requests on newer generations do not delay that cleanup.
+        state.retired_clients.add(failed_client)
+        await _close_unleased_retired_clients(state)
+
+
+async def _close_unleased_retired_clients(state: Any) -> None:
+    retired = tuple(
+        client for client in state.retired_clients
+        if state.client_leases.get(client, 0) == 0
+    )
+    if not retired:
+        return
+    state.retired_clients.difference_update(retired)
+    await asyncio.gather(*(client.aclose() for client in retired),
+                         return_exceptions=True)
+    log.info("closed %d drained upstream client generation(s)", len(retired))
+
+
+def _lease_upstream_client(state: Any, client: httpx.AsyncClient) -> None:
+    state.client_leases[client] = state.client_leases.get(client, 0) + 1
+    state.upstream_active += 1
+
+
+async def _release_upstream_client(state: Any, client: httpx.AsyncClient) -> None:
+    leases = state.client_leases.get(client, 0)
+    if leases <= 1:
+        state.client_leases.pop(client, None)
+    else:
+        state.client_leases[client] = leases - 1
+    state.upstream_active -= 1
+    await _close_unleased_retired_clients(state)
 
 # hop-by-hop / transport-specific headers never forwarded upstream
 _DROP_HEADERS = {
@@ -119,8 +241,9 @@ class UpstreamRounds:
     replayed on every continuation round — mirroring Codex's own per-turn
     OnceLock — unless the downstream request already pinned one."""
 
-    def __init__(self, client: httpx.AsyncClient, responses_url: str,
+    def __init__(self, state: Any, client: httpx.AsyncClient, responses_url: str,
                  headers: dict[str, str]):
+        self.state = state
         self.client = client
         self.responses_url = responses_url
         self.headers = headers
@@ -129,9 +252,15 @@ class UpstreamRounds:
         self._client_pinned_turn_state = any(
             k.lower() == "x-codex-turn-state" for k in headers)
         self._resp: httpx.Response | None = None
+        self._active_request_id: int | None = None
+        self._opened_at: float | None = None
+        # Pin the client for the entire fold, not just one HTTP round. A fold
+        # may close round N and immediately open N+1 on the same client.
+        self._owner_active = True
+        _lease_upstream_client(self.state, self.client)
 
     async def open(self, body: dict[str, Any]) -> AsyncIterator[dict | object]:
-        await self.aclose()
+        await self._close_response()
         headers = {**self.headers, "content-type": "application/json",
                    "accept": "text/event-stream"}
         if self._turn_state is not None and not self._client_pinned_turn_state:
@@ -142,14 +271,40 @@ class UpstreamRounds:
             headers=headers,
             timeout=httpx.Timeout(connect=30, read=600, write=60, pool=30),
         )
+        request_id = next(_REQUEST_IDS)
+        self._active_request_id = request_id
+        self._opened_at = time.monotonic()
+        log.debug("upstream request start id=%d kind=round active=%d generation=%d",
+                  request_id, self.state.upstream_active,
+                  self.state.client_generation)
         try:
             resp = await self.client.send(req, stream=True)
         except httpx.HTTPError as exc:
             # No retry: send() may fail after the request reached the upstream
             # (e.g. ReadTimeout), and a re-send would double-generate the turn.
             detail = _http_error_detail(exc)
-            log.warning("round open upstream transport error: %s: %s",
-                        type(exc).__name__, detail)
+            elapsed = time.monotonic() - self._opened_at
+            self._active_request_id = None
+            self._opened_at = None
+            log.warning(
+                "round open upstream transport error id=%d elapsed=%.3fs "
+                "active=%d generation=%d pool=[%s] proxy=%s: %s: %s",
+                request_id, elapsed, self.state.upstream_active - 1,
+                self.state.client_generation, _pool_snapshot(self.client),
+                _proxy_summary(), type(exc).__name__, detail,
+            )
+            if isinstance(exc, httpx.PoolTimeout):
+                await _recover_upstream_client(
+                    self.state, self.client, "round", "pool-timeout",
+                    current_request_counted=True)
+            elif isinstance(exc, httpx.ConnectError):
+                # A failed SOCKS/HTTP proxy handshake can remain ACTIVE in
+                # httpcore even though no application request owns it. Rotate
+                # only when doing so cannot interrupt another upstream stream.
+                await _recover_upstream_client(
+                    self.state, self.client, "round", "connect-error",
+                    require_no_other_requests=True,
+                    current_request_counted=True)
             raise RoundOpenError(
                 502,
                 f"{type(exc).__name__}: {detail}",
@@ -170,13 +325,26 @@ class UpstreamRounds:
         self._resp = resp
         return parse_sse(resp.aiter_text())
 
-    async def aclose(self) -> None:
+    async def _close_response(self) -> None:
         if self._resp is not None:
             try:
                 await self._resp.aclose()
             except Exception:
                 pass
             self._resp = None
+        if self._active_request_id is not None:
+            elapsed = time.monotonic() - (self._opened_at or time.monotonic())
+            log.debug("upstream request end id=%d kind=round elapsed=%.3fs active=%d",
+                      self._active_request_id, elapsed,
+                      self.state.upstream_active - 1)
+            self._active_request_id = None
+            self._opened_at = None
+
+    async def aclose(self) -> None:
+        await self._close_response()
+        if self._owner_active:
+            self._owner_active = False
+            await _release_upstream_client(self.state, self.client)
 
 
 # --- downstream websocket session state ----------------------------------------
@@ -275,7 +443,7 @@ def unknown_previous_response_frame(exc: UnknownPreviousResponse) -> dict[str, A
 
 
 def make_rounds(state: Any, headers: dict[str, str]) -> UpstreamRounds:
-    return UpstreamRounds(state.client, state.upstream_base + "/responses", headers)
+    return UpstreamRounds(state, state.client, state.upstream_base + "/responses", headers)
 
 
 async def drive_fold(rounds: UpstreamRounds,
@@ -371,6 +539,10 @@ async def responses_ws(ws: WebSocket) -> None:
     # stays bare — adding flags the upstream doesn't declare would skew Codex's
     # context accounting relative to a direct connection.
     await ws.accept()
+    ws_id = next(_REQUEST_IDS)
+    ws.app.state.websocket_active += 1
+    log.info("ws session open id=%d active=%d", ws_id,
+             ws.app.state.websocket_active)
     headers = upstream_headers(ws.headers.raw)
     sess = WsSession()
     try:
@@ -408,8 +580,13 @@ async def responses_ws(ws: WebSocket) -> None:
                 # a failed send_text must not leave the fold generator (and its
                 # upstream connection) dangling until GC finalization
                 await events.aclose()
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as exc:
+        log.info("ws session disconnected id=%d type=%s", ws_id,
+                 type(exc).__name__)
+    finally:
+        ws.app.state.websocket_active -= 1
+        log.info("ws session close id=%d active=%d", ws_id,
+                 ws.app.state.websocket_active)
 
 
 async def passthrough(request: Request) -> Response:
@@ -422,20 +599,40 @@ async def passthrough(request: Request) -> Response:
     if content:
         content = decompress_body(content, request.headers.get("content-encoding"))
     headers = upstream_headers(request.headers.raw)
+    state = request.app.state
+    client = state.client
+    request_id = next(_REQUEST_IDS)
+    started = time.monotonic()
+    _lease_upstream_client(state, client)
     try:
-        upstream = await request.app.state.client.request(
+        upstream = await client.request(
             request.method, url, content=content or None, headers=headers,
             timeout=httpx.Timeout(60),
         )
     except httpx.HTTPError as exc:
         detail = _http_error_detail(exc)
-        log.warning("passthrough upstream error for %s /v1/%s: %s",
-                    request.method, suffix, detail)
+        log.warning(
+            "passthrough upstream error id=%d elapsed=%.3fs active=%d "
+            "generation=%d pool=[%s] proxy=%s for %s /v1/%s: %s: %s",
+            request_id, time.monotonic() - started, state.upstream_active - 1,
+            state.client_generation, _pool_snapshot(client), _proxy_summary(),
+            request.method, suffix, type(exc).__name__, detail,
+        )
+        if isinstance(exc, httpx.PoolTimeout):
+            await _recover_upstream_client(
+                state, client, "passthrough", "pool-timeout",
+                current_request_counted=True)
+        elif isinstance(exc, httpx.ConnectError):
+            await _recover_upstream_client(
+                state, client, "passthrough", "connect-error",
+                require_no_other_requests=True, current_request_counted=True)
         return JSONResponse(
             {"error": {"message": f"upstream connection error: {type(exc).__name__}: {detail}",
                        "code": "upstream_connection_error"}},
             status_code=502,
         )
+    finally:
+        await _release_upstream_client(state, client)
     drop = {"content-encoding", "transfer-encoding", "connection", "content-length"}
     return Response(
         upstream.content, status_code=upstream.status_code,
@@ -444,20 +641,53 @@ async def passthrough(request: Request) -> Response:
 
 
 async def health(request: Request) -> JSONResponse:
-    return JSONResponse({"ok": True, "upstream": request.app.state.upstream_base})
+    state = request.app.state
+    return JSONResponse({
+        "ok": True,
+        "upstream": state.upstream_base,
+        "client_generation": state.client_generation,
+        "active_upstream_requests": state.upstream_active,
+        "active_websockets": state.websocket_active,
+    })
 
 
 def build_app(upstream_base: str | None = None) -> Starlette:
     """Assemble the proxy app. `upstream_base` falls back to the
     CODEXCOMP_UPSTREAM_BASE env var, then the official Codex backend."""
     base = upstream_base or os.environ.get("CODEXCOMP_UPSTREAM_BASE") or DEFAULT_UPSTREAM
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette):
+        log.info(
+            "startup upstream=%s proxy=%s pool_max=%d client_generation=%d",
+            app.state.upstream_base, _proxy_summary(), _POOL_MAX_CONNECTIONS,
+            app.state.client_generation,
+        )
+        try:
+            yield
+        finally:
+            log.info("shutdown active_requests=%d websocket_active=%d pool=[%s]",
+                     app.state.upstream_active, app.state.websocket_active,
+                     _pool_snapshot(app.state.client))
+            await app.state.client.aclose()
+            await asyncio.gather(
+                *(client.aclose() for client in app.state.retired_clients),
+                return_exceptions=True)
+
     app = Starlette(routes=[
         Route("/healthz", health),
         Route("/v1/responses", responses_post, methods=["POST"]),
         WebSocketRoute("/v1/responses", responses_ws),
         Route("/v1/{path:path}", passthrough,
               methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]),
-    ])
-    app.state.client = httpx.AsyncClient(trust_env=True, http2=False)
+    ], lifespan=lifespan)
+    app.state.client_factory = _new_http_client
+    app.state.client = app.state.client_factory()
+    app.state.client_reset_lock = asyncio.Lock()
+    app.state.retired_clients = set()
+    app.state.client_leases = {}
+    app.state.client_generation = 1
+    app.state.upstream_active = 0
+    app.state.websocket_active = 0
     app.state.upstream_base = base.rstrip("/")
     return app

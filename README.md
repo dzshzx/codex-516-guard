@@ -140,6 +140,12 @@ curl -sS http://127.0.0.1:8787/healthz            # {"ok":true,...}
 journalctl --user -u codexcomp -f | grep -E 'round|done'   # Linux/WSL
 ```
 
+The health response also reports the current upstream-client generation and active upstream /
+WebSocket counts. If the shared upstream pool becomes exhausted, codexcomp logs a sanitized pool
+snapshot, rotates the client once, and lets Codex's next retry use a fresh pool without restarting
+the process. A failed proxy handshake is handled the same way when no other upstream stream is
+active, preventing dead handshakes from accumulating into later pool starvation.
+
 A live fold — two consecutive 516s folded, answer correct:
 
 ```

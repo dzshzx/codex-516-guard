@@ -12,7 +12,7 @@ import json
 import httpx
 from starlette.testclient import TestClient
 
-from codexcomp.server import build_app
+from codexcomp.server import _close_unleased_retired_clients, build_app
 
 USER1 = {"type": "message", "role": "user",
          "content": [{"type": "input_text", "text": "hi"}]}
@@ -225,6 +225,48 @@ def test_turn_state_replayed_on_continuation():
     assert resp.headers["x-codex-turn-state"] == "TS_1"
 
 
+def test_fold_keeps_client_owned_across_continuation():
+    """Closing round one must not make a retired pinned client drain mid-fold."""
+    app = build_app("http://upstream.test/v1")
+    calls = 0
+    pinned: httpx.AsyncClient
+
+    def retire_after_first_round(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert app.state.upstream_active == 1
+        if calls == 1:
+            app.state.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(mock_upstream))
+            app.state.client_generation += 1
+            app.state.retired_clients.add(pinned)
+            return httpx.Response(
+                200, content=truncated_sse("resp_retired_1"),
+                headers={"content-type": "text/event-stream"},
+            )
+        assert not pinned.is_closed, "pinned client closed before continuation"
+        return httpx.Response(
+            200, content=canned_sse("resp_retired_2"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    pinned = httpx.AsyncClient(
+        transport=httpx.MockTransport(retire_after_first_round))
+    app.state.client = pinned
+    client = TestClient(app)
+    with client:
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "truncate-once", "stream": True, "input": [USER1]},
+        )
+        assert resp.status_code == 200
+        assert "response.completed" in resp.text
+        assert calls == 2
+        assert pinned.is_closed
+        assert not app.state.retired_clients
+        assert app.state.upstream_active == 0
+
+
 def test_ws_handshake_stays_bare():
     """Codex reads server_reasoning_included ONLY from the 101 upgrade response
     (presence-based). The real backend's handshake does not carry it
@@ -238,19 +280,102 @@ def test_ws_handshake_stays_bare():
 
 
 def test_passthrough_connect_error_returns_502():
-    """GET /v1/models is outside fold(); transport failures still need a response."""
+    """An idle client with a failed proxy handshake is rotated for the next retry."""
     def failing_upstream(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("proxy TLS failed", request=request)
 
     app = build_app("http://upstream.test/v1")
-    app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(failing_upstream))
+    failed = httpx.AsyncClient(transport=httpx.MockTransport(failing_upstream))
+    app.state.client = failed
+    app.state.client_factory = lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"models": []})))
     client = TestClient(app)
-    resp = client.get("/v1/models?client_version=0.143.0")
-    assert resp.status_code == 502, resp.text
-    err = resp.json()["error"]
-    assert err["code"] == "upstream_connection_error"
-    assert "ConnectError" in err["message"]
-    assert "proxy TLS failed" in err["message"]
+    with client:
+        resp = client.get("/v1/models?client_version=0.143.0")
+        assert resp.status_code == 502, resp.text
+        err = resp.json()["error"]
+        assert err["code"] == "upstream_connection_error"
+        assert "ConnectError" in err["message"]
+        assert "proxy TLS failed" in err["message"]
+        assert app.state.client_generation == 2
+        assert app.state.client is not failed
+        assert client.get("/v1/models").status_code == 200
+
+
+def test_connect_error_does_not_interrupt_another_active_request():
+    """Handshake recovery waits when rotating would abort another live stream."""
+    def failing_upstream(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("proxy TLS failed", request=request)
+
+    app = build_app("http://upstream.test/v1")
+    app.state.client = httpx.AsyncClient(
+        transport=httpx.MockTransport(failing_upstream))
+    app.state.upstream_active = 1  # one independently tracked live stream
+    app.state.client_leases[app.state.client] = 1
+    client = TestClient(app)
+    with client:
+        resp = client.get("/v1/models")
+        assert resp.status_code == 502, resp.text
+        assert app.state.client_generation == 1
+        assert app.state.upstream_active == 1
+        app.state.upstream_active = 0
+        app.state.client_leases.clear()
+
+
+def test_pool_timeout_rotates_client_once():
+    """A saturated/wedged shared pool must self-heal without a process restart."""
+    def exhausted(request: httpx.Request) -> httpx.Response:
+        raise httpx.PoolTimeout("no connection available", request=request)
+
+    app = build_app("http://upstream.test/v1")
+    failed = httpx.AsyncClient(transport=httpx.MockTransport(exhausted))
+    app.state.client = failed
+
+    def recovered(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"models": []})
+
+    app.state.client_factory = lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(recovered))
+    client = TestClient(app)
+    with client:
+        resp = client.get("/v1/models")
+        assert resp.status_code == 502, resp.text
+        assert app.state.client_generation == 2
+        assert app.state.client is not failed
+        assert app.state.upstream_active == 0
+        resp = client.get("/v1/models")
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"models": []}
+        assert app.state.client_generation == 2
+
+
+def test_pool_timeout_does_not_close_another_active_stream():
+    """Pool recovery swaps new work over but lets an old live stream drain."""
+    def exhausted(request: httpx.Request) -> httpx.Response:
+        raise httpx.PoolTimeout("no connection available", request=request)
+
+    app = build_app("http://upstream.test/v1")
+    failed = httpx.AsyncClient(transport=httpx.MockTransport(exhausted))
+    app.state.client = failed
+    app.state.client_factory = lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"models": []})))
+    app.state.upstream_active = 1  # independently tracked live stream
+    app.state.client_leases[failed] = 1
+    client = TestClient(app)
+    with client:
+        resp = client.get("/v1/models")
+        assert resp.status_code == 502, resp.text
+        assert app.state.client_generation == 2
+        assert failed in app.state.retired_clients
+        assert not failed.is_closed
+        assert app.state.upstream_active == 1
+        app.state.upstream_active = 0
+        app.state.client_leases.clear()
+        client.portal.call(_close_unleased_retired_clients, app.state)
+        assert failed.is_closed
+        assert not app.state.retired_clients
 
 
 def clear_state():
@@ -266,8 +391,12 @@ def main():
                  test_post_sse_unchanged,
                  test_post_header_propagation,
                  test_turn_state_replayed_on_continuation,
+                 test_fold_keeps_client_owned_across_continuation,
                  test_ws_handshake_stays_bare,
-                 test_passthrough_connect_error_returns_502):
+                 test_passthrough_connect_error_returns_502,
+                 test_connect_error_does_not_interrupt_another_active_request,
+                 test_pool_timeout_rotates_client_once,
+                 test_pool_timeout_does_not_close_another_active_stream):
         clear_state()
         test()
     print("ws transport self-test: ALL PASS")
