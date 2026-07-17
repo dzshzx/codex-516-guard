@@ -238,19 +238,45 @@ def test_ws_handshake_stays_bare():
 
 
 def test_passthrough_connect_error_returns_502():
-    """GET /v1/models is outside fold(); transport failures still need a response."""
+    """An idle client with a failed proxy handshake is rotated for the next retry."""
     def failing_upstream(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("proxy TLS failed", request=request)
 
     app = build_app("http://upstream.test/v1")
-    app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(failing_upstream))
+    failed = httpx.AsyncClient(transport=httpx.MockTransport(failing_upstream))
+    app.state.client = failed
+    app.state.client_factory = lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"models": []})))
     client = TestClient(app)
-    resp = client.get("/v1/models?client_version=0.143.0")
-    assert resp.status_code == 502, resp.text
-    err = resp.json()["error"]
-    assert err["code"] == "upstream_connection_error"
-    assert "ConnectError" in err["message"]
-    assert "proxy TLS failed" in err["message"]
+    with client:
+        resp = client.get("/v1/models?client_version=0.143.0")
+        assert resp.status_code == 502, resp.text
+        err = resp.json()["error"]
+        assert err["code"] == "upstream_connection_error"
+        assert "ConnectError" in err["message"]
+        assert "proxy TLS failed" in err["message"]
+        assert app.state.client_generation == 2
+        assert app.state.client is not failed
+        assert client.get("/v1/models").status_code == 200
+
+
+def test_connect_error_does_not_interrupt_another_active_request():
+    """Handshake recovery waits when rotating would abort another live stream."""
+    def failing_upstream(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("proxy TLS failed", request=request)
+
+    app = build_app("http://upstream.test/v1")
+    app.state.client = httpx.AsyncClient(
+        transport=httpx.MockTransport(failing_upstream))
+    app.state.upstream_active = 1  # one independently tracked live stream
+    client = TestClient(app)
+    with client:
+        resp = client.get("/v1/models")
+        assert resp.status_code == 502, resp.text
+        assert app.state.client_generation == 1
+        assert app.state.upstream_active == 1
+        app.state.upstream_active = 0
 
 
 def test_pool_timeout_rotates_client_once():
@@ -295,6 +321,7 @@ def main():
                  test_turn_state_replayed_on_continuation,
                  test_ws_handshake_stays_bare,
                  test_passthrough_connect_error_returns_502,
+                 test_connect_error_does_not_interrupt_another_active_request,
                  test_pool_timeout_rotates_client_once):
         clear_state()
         test()

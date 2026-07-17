@@ -102,23 +102,33 @@ def _pool_snapshot(client: httpx.AsyncClient) -> str:
     return ";".join(pools) or "unavailable"
 
 
-async def _recover_exhausted_pool(state: Any, failed_client: httpx.AsyncClient,
-                                  context: str) -> None:
-    """Rotate a wedged pool once; later retries use a clean client immediately."""
+async def _recover_upstream_client(
+        state: Any, failed_client: httpx.AsyncClient, context: str, reason: str,
+        *, require_no_other_requests: bool = False,
+        current_request_counted: bool = False) -> None:
+    """Rotate a broken pool once; later retries use a clean client immediately."""
     async with state.client_reset_lock:
         if state.client is not failed_client:
+            return
+        other_requests = state.upstream_active - int(current_request_counted)
+        if require_no_other_requests and other_requests > 0:
+            log.warning(
+                "upstream client rotation deferred context=%s reason=%s "
+                "other_active_requests=%d",
+                context, reason, other_requests,
+            )
             return
         old_snapshot = _pool_snapshot(failed_client)
         state.client = state.client_factory()
         state.client_generation += 1
         log.error(
-            "upstream pool exhausted; rotated client generation=%d context=%s "
+            "rotated upstream client generation=%d context=%s reason=%s "
             "active_requests=%d old_pool=[%s] proxy=%s",
-            state.client_generation, context, state.upstream_active,
-            old_snapshot, _proxy_summary(),
+            state.client_generation, context, reason,
+            state.upstream_active, old_snapshot, _proxy_summary(),
         )
-        # PoolTimeout means an interactive request already waited 30 seconds for
-        # a slot. Abort the wedged generation so its sockets cannot remain stuck.
+        # A retired generation is never reused. Closing it also reclaims sockets
+        # left ACTIVE by failed proxy handshakes.
         await failed_client.aclose()
 
 # hop-by-hop / transport-specific headers never forwarded upstream
@@ -252,7 +262,15 @@ class UpstreamRounds:
                 _proxy_summary(), type(exc).__name__, detail,
             )
             if isinstance(exc, httpx.PoolTimeout):
-                await _recover_exhausted_pool(self.state, self.client, "round")
+                await _recover_upstream_client(
+                    self.state, self.client, "round", "pool-timeout")
+            elif isinstance(exc, httpx.ConnectError):
+                # A failed SOCKS/HTTP proxy handshake can remain ACTIVE in
+                # httpcore even though no application request owns it. Rotate
+                # only when doing so cannot interrupt another upstream stream.
+                await _recover_upstream_client(
+                    self.state, self.client, "round", "connect-error",
+                    require_no_other_requests=True)
             raise RoundOpenError(
                 502,
                 f"{type(exc).__name__}: {detail}",
@@ -561,7 +579,13 @@ async def passthrough(request: Request) -> Response:
             request.method, suffix, type(exc).__name__, detail,
         )
         if isinstance(exc, httpx.PoolTimeout):
-            await _recover_exhausted_pool(state, client, "passthrough")
+            await _recover_upstream_client(
+                state, client, "passthrough", "pool-timeout",
+                current_request_counted=True)
+        elif isinstance(exc, httpx.ConnectError):
+            await _recover_upstream_client(
+                state, client, "passthrough", "connect-error",
+                require_no_other_requests=True, current_request_counted=True)
         return JSONResponse(
             {"error": {"message": f"upstream connection error: {type(exc).__name__}: {detail}",
                        "code": "upstream_connection_error"}},
